@@ -62,10 +62,12 @@ void ggml_cuda_op_hc_mix_tail(ggml_backend_cuda_context & ctx,
         n_embd, hc, scale, total, n_embd_fastdiv);
 }
 
-// one block per (stream h, token t): the block reduces w_inject[:, h] . xn[:, t]
-// (float4 loads, several in flight — a single block is latency-bound on the
-// ~80 KB it reads), then writes stream h of the token. Spreading the streams
-// over blocks costs re-reading xn from L2 but keeps every SM busy at T = 1.
+// one block per (stream h, token t, output slice z): the block reduces
+// w_inject[:, h] . xn[:, t] (float4 loads, several in flight — a single block
+// is latency-bound on the ~80 KB it reads), then writes its slice of stream h
+// of the token. At T = 1 only hc blocks would exist, so the output is split
+// over gridDim.z blocks that each redo the (L2-resident) dot product; the
+// redundant reads are cheaper than leaving 76 SMs idle.
 template <int BLOCK>
 static __global__ void hc_combine_kernel(
         const float * __restrict__ residual,
@@ -77,17 +79,37 @@ static __global__ void hc_combine_kernel(
         const int   hc,
         const float s_pre,
         const float s_post) {
+    constexpr int PF = 4; // output-phase float4 pairs prefetched per thread before the dot product
+
     const int h       = blockIdx.x;
     const int t       = blockIdx.y;
     const int tid     = threadIdx.x;
     const int hc_dim  = n_embd*hc;
     const int hc_dim4 = hc_dim/4;
 
+    const int    n4     = n_embd/4;
+    const int    z0     = (int) (((int64_t) n4*blockIdx.z)/gridDim.z);
+    const int    z1     = (int) (((int64_t) n4*(blockIdx.z + 1))/gridDim.z);
+    const float4 * res4 = (const float4 *) (residual + (int64_t) t*hc_dim + (int64_t) h*n_embd);
+    const float4 * blk4 = (const float4 *) (block    + (int64_t) t*n_embd);
+    float4       * dst4 = (float4 *)       (dst      + (int64_t) t*hc_dim + (int64_t) h*n_embd);
+
+    // issue the output-phase loads first so their latency overlaps the dot product
+    float4 r_pf[PF], b_pf[PF];
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+        const int e = z0 + tid + i*BLOCK;
+        if (e < z1) {
+            r_pf[i] = res4[e];
+            b_pf[i] = blk4[e];
+        }
+    }
+
     const float4 * xn_t = (const float4 *) (xn + (int64_t) t*hc_dim);
     const float4 * w_h  = (const float4 *) (w_inject + (int64_t) h*hc_dim);
 
     float acc = 0.0f;
-#pragma unroll 8
+#pragma unroll 16
     for (int k = tid; k < hc_dim4; k += BLOCK) {
         const float4 x = xn_t[k];
         const float4 w = w_h[k];
@@ -113,14 +135,24 @@ static __global__ void hc_combine_kernel(
     }
     __syncthreads();
 
-    const float  w      = s_w;
-    const int    n4     = n_embd/4;
-    const float4 * res4 = (const float4 *) (residual + (int64_t) t*hc_dim + (int64_t) h*n_embd);
-    const float4 * blk4 = (const float4 *) (block    + (int64_t) t*n_embd);
-    float4       * dst4 = (float4 *)       (dst      + (int64_t) t*hc_dim + (int64_t) h*n_embd);
+    const float w = s_w;
 
-#pragma unroll 4
-    for (int e = tid; e < n4; e += BLOCK) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+        const int e = z0 + tid + i*BLOCK;
+        if (e < z1) {
+            const float4 r = r_pf[i];
+            const float4 b = b_pf[i];
+            float4 o;
+            o.x = __fadd_rn(r.x, __fmul_rn(b.x, w));
+            o.y = __fadd_rn(r.y, __fmul_rn(b.y, w));
+            o.z = __fadd_rn(r.z, __fmul_rn(b.z, w));
+            o.w = __fadd_rn(r.w, __fmul_rn(b.w, w));
+            dst4[e] = o;
+        }
+    }
+    // remainder (only when a block's slice exceeds PF*BLOCK float4)
+    for (int e = z0 + tid + PF*BLOCK; e < z1; e += BLOCK) {
         const float4 r = res4[e];
         const float4 b = blk4[e];
         float4 o;
@@ -155,7 +187,10 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(n_embd % 4 == 0); // float4 loads over xn / w_inject rows
 
     constexpr int BLOCK = 256;
-    const dim3 grid(hc, T);
+    // enough blocks to cover the SMs: at T = 1 split each stream's output 8 ways
+    const int nsm   = ggml_cuda_info().devices[ctx.device].nsm;
+    const int split = std::max(1, std::min(8, nsm/(hc*T)));
+    const dim3 grid(hc, T, split);
     hc_combine_kernel<BLOCK><<<grid, BLOCK, 0, ctx.stream()>>>(
         (const float *) residual->data, (const float *) block->data,
         (const float *) xn->data, (const float *) w_inject->data, (float *) dst->data,
