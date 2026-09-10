@@ -222,6 +222,11 @@ extern "C" {
 
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
+        // multi-token prediction (NextN) draft context. llama_decode() input conventions:
+        //   - batch.token + batch.embd : token ids for the input embedding lookup, batch.embd holds the
+        //                                target hidden state per token (n_embd_out floats)
+        //   - batch.embd only          : packed rows [input embedding (n_embd_inp) | target hidden state (n_embd_out)]
+        //                                per token - used for multimodal chunks, where there are no token ids
         LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
 

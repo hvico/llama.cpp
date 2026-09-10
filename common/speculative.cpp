@@ -1326,12 +1326,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     llama_batch batch;
 
+    // token-less draft batch for multimodal chunks: each row packs the input embedding the target
+    // consumed at that position followed by the target hidden state (see LLAMA_CONTEXT_TYPE_MTP)
+    struct {
+        std::vector<float>          embd;       // [n_embd_inp + n_embd, n_tokens]
+        std::vector<llama_pos>      pos;        // [n_pos_per_embd * n_tokens], same layout as the target batch
+        std::vector<int32_t>        n_seq_id;
+        std::vector<llama_seq_id>   seq_id;
+        std::vector<llama_seq_id *> seq_id_ptr;
+        std::vector<int8_t>         logits;
+        llama_batch                 batch = {};
+
+        void resize(int32_t n_tokens, int32_t n_pos_per_embd, int32_t row) {
+            embd      .resize((size_t) n_tokens * row);
+            pos       .resize((size_t) n_tokens * n_pos_per_embd);
+            n_seq_id  .resize(n_tokens);
+            seq_id    .resize(n_tokens);
+            seq_id_ptr.resize(n_tokens + 1, nullptr);
+            logits    .resize(n_tokens);
+
+            batch.token    = nullptr;
+            batch.embd     = embd.data();
+            batch.pos      = pos.data();
+            batch.n_seq_id = n_seq_id.data();
+            batch.seq_id   = seq_id_ptr.data();
+            batch.logits   = logits.data();
+        }
+    } batch_x;
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
-    int32_t n_embd = 0;
+    int32_t n_embd         = 0; // target hidden state width (h)
+    int32_t n_embd_inp     = 0; // input embedding width (x), e.g. what mtmd produces
+    int32_t n_pos_per_embd = 1; // 4 for M-RoPE models
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1385,6 +1415,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+
+        {
+            const auto * model_dft = llama_get_model(ctx_dft);
+            const auto rope_type = llama_model_rope_type(model_dft);
+
+            n_embd_inp     = llama_model_n_embd_inp(model_dft);
+            n_pos_per_embd = (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+
+            batch_x.resize(n_b, n_pos_per_embd, n_embd_inp + n_embd);
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1480,8 +1520,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        // token batches carry token ids; multimodal chunks (mtmd) carry input embeddings instead
+        const bool is_embd = batch_in.token == nullptr;
+
+        if (is_embd && batch_in.embd == nullptr) {
             return true;
         }
 
@@ -1511,10 +1553,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
-            common_batch_clear(batch);
+            // where the (shifted) target hidden states go, and the row stride in floats
+            float * h_dst    = nullptr;
+            size_t  h_stride = 0;
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+            if (!is_embd) {
+                common_batch_clear(batch);
+
+                for (int k = 0; k < n_tokens; ++k) {
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                }
+
+                h_dst    = batch.embd;
+                h_stride = n_embd;
+            } else {
+                // multimodal chunk: no token ids, so the draft receives packed rows [x | h] where x is the
+                // input embedding the target consumed at that position (see LLAMA_CONTEXT_TYPE_MTP)
+                const size_t row = (size_t) n_embd_inp + n_embd;
+
+                if ((int32_t) batch_x.n_seq_id.size() < n_tokens) {
+                    batch_x.resize(n_tokens, n_pos_per_embd, (int32_t) row);
+                }
+
+                for (int k = 0; k < n_tokens; ++k) {
+                    std::memcpy(batch_x.embd.data() + (size_t) k * row, batch_in.embd + (size_t) k * n_embd_inp, n_embd_inp*sizeof(float));
+
+                    batch_x.n_seq_id  [k] = 1;
+                    batch_x.seq_id    [k] = batch_in.seq_id[k][0];
+                    batch_x.seq_id_ptr[k] = &batch_x.seq_id[k];
+                    batch_x.logits    [k] = 0;
+                }
+
+                // token-less batches carry n_pos_per_embd positions per token (M-RoPE: t, y, x, z) - keep the layout
+                std::memcpy(batch_x.pos.data(), batch_in.pos, (size_t) n_pos_per_embd * n_tokens * sizeof(llama_pos));
+
+                batch_x.batch.n_tokens = n_tokens;
+
+                h_dst    = batch_x.embd.data() + n_embd_inp;
+                h_stride = row;
             }
 
             // shift the tgt embeddings to the right by one position
@@ -1524,21 +1600,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+
+                for (int k = 1; k < n_tokens; ++k) {
+                    std::memcpy(h_dst + (size_t) k * h_stride, h_tgt + (size_t) (k - 1) * n_embd, row_bytes);
+                }
             }
 
             // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                std::memcpy(h_dst + (size_t) i_batch_beg[seq_id] * h_stride, pending_h[seq_id].data(), row_bytes);
             }
+
+            const llama_batch & batch_dft = is_embd ? batch_x.batch : batch;
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
@@ -1555,7 +1632,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                const int32_t rc = llama_decode(ctx_dft, batch_dft);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);

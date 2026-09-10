@@ -96,22 +96,47 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
     if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
-    } else {
-        // note: mtmd embedding input goes through here
-        GGML_ASSERT(ubatch->embd);
-        GGML_ASSERT(n_embd == embd->ne[0]);
 
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        // the embeddings are the target hidden states
+        if (ubatch->embd) {
+            GGML_ASSERT(n_embd == h->ne[0]);
+
+            ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        }
+
+        return;
     }
 
-    // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
-    //       for now, we assume that the hidden state is always provided as an embedding
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
-        GGML_ASSERT(n_embd == h->ne[0]);
+    // no token ids (multimodal chunks): each ubatch row packs [x | h] - the input embedding that the
+    // target consumed at this position, followed by the target hidden state (see LLAMA_CONTEXT_TYPE_MTP)
+    GGML_ASSERT(ubatch->embd);
 
-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+    const int64_t n_x = embd->ne[0];
+    const int64_t n_h = h->ne[0];
+
+    if (ubatch->n_embd == (uint32_t) (n_x + n_h)) {
+        std::vector<float> buf_x((size_t) n_tokens*n_x);
+        std::vector<float> buf_h((size_t) n_tokens*n_h);
+
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const float * row = ubatch->embd + (size_t) i*(n_x + n_h);
+
+            std::memcpy(buf_x.data() + (size_t) i*n_x, row,       n_x*sizeof(float));
+            std::memcpy(buf_h.data() + (size_t) i*n_h, row + n_x, n_h*sizeof(float));
+        }
+
+        ggml_backend_tensor_set(embd, buf_x.data(), 0, buf_x.size()*ggml_element_size(embd));
+        ggml_backend_tensor_set(h,    buf_h.data(), 0, buf_h.size()*ggml_element_size(h));
+
+        return;
     }
+
+    // legacy: a single embedding row used for both inputs
+    GGML_ASSERT(n_embd == embd->ne[0]);
+    GGML_ASSERT(n_embd == h->ne[0]);
+
+    ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+    ggml_backend_tensor_set(h,    ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
 }
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
