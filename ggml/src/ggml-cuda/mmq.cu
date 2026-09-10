@@ -82,6 +82,31 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+// Tile width hint for MoE: tokens are spread over the experts so each expert only sees
+// ~n_tokens*n_expert_used/n_expert columns; a full-width tile would mostly compute padding.
+static int64_t mmq_ids_J_hint(const int cc, const int64_t n_tokens, const int64_t n_expert_used, const int64_t n_expert) {
+    static const int64_t env = [] {
+        const char * s = getenv("GGML_MMQ_IDS_J"); // debug override (0: default tile choice)
+        return s ? int64_t(atoi(s)) : int64_t(-1);
+    }();
+    if (env == 0) {
+        return 0;
+    }
+    if (env > 0) {
+        return env;
+    }
+    // Only tuned for the dp4a kernels (Volta/Pascal); the MMA data layout keeps the default choice.
+    if (ggml_cuda_mmq_get_config(GGML_TYPE_Q4_K, 8, false, cc).use_mma_data_layout(cc)) {
+        return 0;
+    }
+    // Measured on V100 (Qwen3.5-style MoE, 10/512 experts): the best tile width is ~2x the average
+    // number of tokens per expert, in [24, 64].
+    const int64_t tokens_per_expert = (n_tokens*n_expert_used + n_expert - 1) / n_expert;
+    int64_t J = 2*tokens_per_expert;
+    J = (J + 7) & ~int64_t(7);
+    return std::max(int64_t(24), std::min(int64_t(64), J));
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -171,7 +196,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, 0};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -251,7 +276,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, mmq_ids_J_hint(cc, ne12, n_expert_used, ne02)};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -324,6 +349,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #endif //GGML_CUDA_FORCE_MMQ
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        // Volta has FP16 tensor cores but no int8 MMA, so cuBLAS wins for large dense GEMMs.
+        // For MoE the alternative to MMQ is the generic mul_mat_id path (host-side token sort +
+        // stream sync + one GEMM per expert), which is far slower than batched dp4a MMQ.
+        if (volta_mma_available(cc) && n_experts > 0) {
+            return true;
+        }
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
 

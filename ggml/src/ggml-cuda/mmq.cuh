@@ -226,6 +226,13 @@ struct ggml_cuda_mmq_config {
 
 #undef CASE
 
+// Volta has no int8 tensor cores, so MMQ runs the dp4a kernels there. Measured on V100 the Pascal dp4a
+// tiles (I=64, 2 blocks/SM) are ~25% faster than the Ampere tiles for wide tiles (MoE prefill),
+// while the Ampere tiles (I=128, stream-k) are ~8% faster for narrow tiles (small dense batches).
+static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_volta(ggml_type type, int J, bool fallback) {
+    return J <= 16 ? ggml_cuda_mmq_get_config_ampere(type, J, fallback) : ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+}
+
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -245,8 +252,11 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     if (blackwell_mma_available(cc)) {
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
-    if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
+    if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+    }
+    if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
+        return ggml_cuda_mmq_get_config_volta(type, J, fallback);
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A) {
         return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
@@ -270,8 +280,10 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #else
 #ifdef BLACKWELL_MMA_AVAILABLE
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
-#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    return ggml_cuda_mmq_get_config_volta(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
     return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
 #else
@@ -1376,6 +1388,7 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    int64_t J_hint; // > 0: prefer the smallest tile width >= J_hint (MoE: expected tokens per expert)
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1491,6 +1504,10 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
             ntiles_J_best = ntiles_x;
+        }
+
+        if (args.J_hint > 0 && J >= args.J_hint) {
+            break;
         }
     }
 
