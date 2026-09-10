@@ -3904,6 +3904,132 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// qwen4exp hyper-connection "mix tail":
+//   sigmoid(y) -> mul(xn, .) -> reshape [n_embd, hc, T] -> mean over the hc streams (cont + adds + scale)
+// CUDA fuses the whole chain into one kernel; the graph mirrors llama_model_qwen4exp::graph::build_hc_mix.
+struct test_hc_mix_fuse : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    test_hc_mix_fuse(int64_t n_embd = 64, int64_t hc = 4, int64_t nt = 3)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * xn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, nt);
+        ggml_set_name(xn, "xn");
+        ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, nt);
+        ggml_set_name(y, "y");
+
+        ggml_tensor * gate  = ggml_sigmoid(ctx, y);
+        ggml_tensor * gated = ggml_mul(ctx, xn, gate);
+        gated = ggml_reshape_3d(ctx, gated, n_embd, hc, nt);
+
+        ggml_tensor * mixed = ggml_view_2d(ctx, gated, n_embd, nt, ggml_row_size(gated->type, n_embd)*hc, 0);
+        mixed = ggml_cont(ctx, mixed);
+        for (int64_t c = 1; c < hc; ++c) {
+            ggml_tensor * s = ggml_view_2d(ctx, gated, n_embd, nt,
+                    ggml_row_size(gated->type, n_embd)*hc, ggml_row_size(gated->type, n_embd)*c);
+            mixed = ggml_add(ctx, mixed, s);
+        }
+        mixed = ggml_scale(ctx, mixed, 1.0f / (float) hc);
+        ggml_set_name(mixed, "out");
+        return mixed;
+    }
+};
+
+// qwen4exp hyper-connection "combine":
+//   w = 2*sigmoid(mul_mat(w_inject, xn)/hc); out = residual + repeat(block) * w
+// mirrors llama_model_qwen4exp::graph::build_hc_combine (+ the inject mul_mat from build_hc_mix)
+struct test_hc_combine_fuse : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_COMBINE_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // the inject dot products are reduced in a different order than mul_mat_vec_f
+    double max_nmse_err() override { return 1e-6; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    test_hc_combine_fuse(int64_t n_embd = 64, int64_t hc = 4, int64_t nt = 3)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * block = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+        ggml_set_name(block, "block");
+        ggml_tensor * xn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, nt);
+        ggml_set_name(xn, "xn");
+        ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc);
+        ggml_set_name(w_inject, "w_inject");
+
+        ggml_tensor * inject = ggml_mul_mat(ctx, w_inject, xn);
+
+        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx, w, 2.0f);
+        w = ggml_reshape_3d(ctx, w, 1, hc, nt);
+
+        ggml_tensor * b = ggml_reshape_3d(ctx, block, n_embd, 1, nt);
+        b = ggml_repeat_4d(ctx, b, n_embd, hc, nt, 1);
+
+        ggml_tensor * out = ggml_add(ctx, residual, ggml_mul(ctx, b, w));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// scale -> silu | sigmoid fused into one kernel
+struct test_scale_unary_fuse : public test_case {
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+    const float scale;
+    const float bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_UNARY_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(op, ne, scale, bias);
+    }
+
+    test_scale_unary_fuse(ggml_unary_op op = GGML_UNARY_OP_SILU, std::array<int64_t, 4> ne = {320, 3, 1, 1},
+            float scale = 0.25f, float bias = 0.0f)
+        : op(op), ne(ne), scale(scale), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_unary(ctx, ggml_scale_bias(ctx, x, scale, bias), op);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -8593,6 +8719,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
+    // qwen4exp hyper-connection fusions
+    for (int64_t nt : { 1, 3, 17 }) {
+        test_cases.emplace_back(new test_hc_mix_fuse(64, 4, nt));
+        test_cases.emplace_back(new test_hc_mix_fuse(2560, 4, nt));
+        test_cases.emplace_back(new test_hc_mix_fuse(96, 2, nt));
+        test_cases.emplace_back(new test_hc_combine_fuse(64, 4, nt));
+        test_cases.emplace_back(new test_hc_combine_fuse(2560, 4, nt));
+        test_cases.emplace_back(new test_hc_combine_fuse(96, 2, nt));
+    }
+    test_cases.emplace_back(new test_scale_unary_fuse(GGML_UNARY_OP_SILU,    {320, 3, 1, 1}, 0.25f, 0.0f));
+    test_cases.emplace_back(new test_scale_unary_fuse(GGML_UNARY_OP_SIGMOID, {320, 3, 1, 1}, 0.25f, 0.0f));
+    test_cases.emplace_back(new test_scale_unary_fuse(GGML_UNARY_OP_SILU,    {1027, 5, 2, 1}, 1.5f, 0.3f));
+
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block
         test_cases.emplace_back(new test_snake_fuse(type, {  33,  32, 1, 1}));   // boundary

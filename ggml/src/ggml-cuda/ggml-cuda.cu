@@ -45,6 +45,7 @@
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/snake.cuh"
+#include "ggml-cuda/hc-fused.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
@@ -3424,6 +3425,20 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// exact aliasing (same data pointer) is safe for kernels that read an element
+// and write the same element from the same thread; any other overlap is not
+static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const int64_t a0 = (int64_t) a->data, a1 = a0 + (int64_t) ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+    const int64_t b0 = (int64_t) b->data, b1 = b0 + (int64_t) ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+    return (b0 <= a0 && a0 < b1) || (a0 <= b0 && b0 < a1);
+}
+static bool ggml_cuda_alias_ok(const ggml_tensor * dst, const ggml_tensor * src, bool exact_alias_ok) {
+    if (!ggml_cuda_tensors_overlap(dst, src)) {
+        return true;
+    }
+    return exact_alias_ok && dst->data == src->data;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3588,6 +3603,156 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // debug: bitmask 1 = combine, 2 = mix tail, 4 = scale+unary
+    static int disable_hc_fusion = getenv("GGML_CUDA_DISABLE_HC_FUSION") != nullptr ? std::atoi(getenv("GGML_CUDA_DISABLE_HC_FUSION")) : 0;
+
+    // qwen4exp hyper-connection combine:
+    //   repeat(block) -> mul_mat(w_inject, xn) -> scale -> sigmoid -> scale -> reshape -> mul -> add(residual)
+    // dst[e, h, t] = residual[e, h, t] + block[e, t] * s_post*sigmoid(s_pre*(w_inject[:, h] . xn[:, t]))
+    if (!(disable_hc_fusion & 1) && node->op == GGML_OP_REPEAT) {
+        const ggml_op ops[8] = { GGML_OP_REPEAT, GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY,
+                                 GGML_OP_SCALE,  GGML_OP_RESHAPE, GGML_OP_MUL,   GGML_OP_ADD };
+        const int out_nodes[1] = { i + 7 };
+
+        if (ggml_can_fuse_subgraph(cgraph, i, 8, ops, out_nodes, 1)) {
+            const ggml_tensor * repeat  = cgraph->nodes[i];
+            const ggml_tensor * mm      = cgraph->nodes[i + 1];
+            const ggml_tensor * scale0  = cgraph->nodes[i + 2];
+            const ggml_tensor * sigm    = cgraph->nodes[i + 3];
+            const ggml_tensor * scale1  = cgraph->nodes[i + 4];
+            const ggml_tensor * reshape = cgraph->nodes[i + 5];
+            const ggml_tensor * mul     = cgraph->nodes[i + 6];
+            ggml_tensor *       add     = cgraph->nodes[i + 7];
+
+            const ggml_tensor * block    = repeat->src[0];
+            const ggml_tensor * w_inject = mm->src[0];
+            const ggml_tensor * xn       = mm->src[1];
+            const ggml_tensor * residual = (add->src[0] == mul) ? add->src[1] : add->src[0];
+
+            const int64_t n_embd = add->ne[0];
+            const int64_t hc     = add->ne[1];
+            const int64_t T      = add->ne[2]*add->ne[3];
+
+            const bool chain_ok =
+                scale0->src[0] == mm && sigm->src[0] == scale0 && ggml_get_unary_op(sigm) == GGML_UNARY_OP_SIGMOID &&
+                scale1->src[0] == sigm && reshape->src[0] == scale1 &&
+                ((mul->src[0] == repeat && mul->src[1] == reshape) || (mul->src[0] == reshape && mul->src[1] == repeat)) &&
+                (add->src[0] == mul || add->src[1] == mul) && residual != mul;
+
+            const bool shape_ok = chain_ok &&
+                add->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 && block->type == GGML_TYPE_F32 &&
+                xn->type == GGML_TYPE_F32 && w_inject->type == GGML_TYPE_F32 &&
+                hc <= 8 && ggml_are_same_shape(add, residual) && ggml_is_contiguous(residual) &&
+                block->ne[0] == n_embd && ggml_nrows(block) == T && ggml_is_contiguous(block) &&
+                xn->ne[0] == n_embd*hc && ggml_nrows(xn) == T && ggml_is_contiguous(xn) &&
+                w_inject->ne[0] == n_embd*hc && w_inject->ne[1] == hc && ggml_is_contiguous(w_inject) &&
+                mm->ne[0] == hc && ggml_nrows(mm) == T &&
+                reshape->ne[0] == 1 && reshape->ne[1] == hc && reshape->ne[2]*reshape->ne[3] == T &&
+                ggml_are_same_shape(repeat, add) && ggml_is_contiguous(add);
+
+            float s_pre[2], s_post[2];
+            memcpy(s_pre,  scale0->op_params, sizeof(s_pre));
+            memcpy(s_post, scale1->op_params, sizeof(s_post));
+
+            // the allocator may place the add in-place over residual (and xn dies inside the
+            // region, so dst may reuse it): both are read row-by-row by the block that writes
+            // that same row, so exact aliasing is safe; block/w_inject must not overlap at all
+            const bool mem_ok = shape_ok &&
+                ggml_cuda_alias_ok(add, residual, true) && ggml_cuda_alias_ok(add, xn, true) &&
+                ggml_cuda_alias_ok(add, block, false) && ggml_cuda_alias_ok(add, w_inject, false);
+
+            // no bias on either scale (ggml_scale_bias would need the affine form)
+            if (mem_ok && s_pre[1] == 0.0f && s_post[1] == 0.0f) {
+                ggml_cuda_op_hc_combine(*cuda_ctx, residual, block, xn, w_inject, s_pre[0], s_post[0], add);
+                return 7;
+            }
+        }
+    }
+
+    // qwen4exp hyper-connection mix tail:
+    //   sigmoid(y) -> mul(xn, .) -> reshape -> [view -> cont] -> (view -> add) x (hc-1) -> scale
+    // dst[e, t] = scale * sum_h xn[e + h*n_embd, t] * sigmoid(y[e + h*n_embd, t])
+    if (!(disable_hc_fusion & 2) && node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
+            i + 5 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+            cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 3]->op == GGML_OP_VIEW &&
+            cgraph->nodes[i + 4]->op == GGML_OP_CONT) {
+        const ggml_tensor * sigm    = node;
+        const ggml_tensor * mul     = cgraph->nodes[i + 1];
+        const ggml_tensor * reshape = cgraph->nodes[i + 2];
+        const ggml_tensor * y       = sigm->src[0];
+        const ggml_tensor * xn      = (mul->src[0] == sigm) ? mul->src[1] : mul->src[0];
+
+        const int64_t n_embd = reshape->ne[0];
+        const int64_t hc     = reshape->ne[1];
+        const int     n_ops  = 6 + 2*((int) hc - 1);
+
+        if (hc >= 2 && hc <= 8 && n_embd*hc == xn->ne[0] && i + n_ops <= cgraph->n_nodes) {
+            ggml_op ops[32];
+            ops[0] = GGML_OP_UNARY; ops[1] = GGML_OP_MUL; ops[2] = GGML_OP_RESHAPE; ops[3] = GGML_OP_VIEW; ops[4] = GGML_OP_CONT;
+            for (int h = 1; h < hc; ++h) {
+                ops[5 + 2*(h - 1)] = GGML_OP_VIEW;
+                ops[6 + 2*(h - 1)] = GGML_OP_ADD;
+            }
+            ops[n_ops - 1] = GGML_OP_SCALE;
+            const int out_nodes[1] = { i + n_ops - 1 };
+
+            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1)) {
+                ggml_tensor * scale = cgraph->nodes[i + n_ops - 1];
+
+                // every view must be stream h of the reshaped [n_embd, hc, T] product
+                bool chain_ok = (mul->src[0] == sigm || mul->src[1] == sigm) && reshape->src[0] == mul &&
+                                ggml_are_same_shape(xn, y) && xn->type == GGML_TYPE_F32 && y->type == GGML_TYPE_F32 &&
+                                ggml_is_contiguous(xn) && ggml_is_contiguous(y) && ggml_is_contiguous(mul) &&
+                                reshape->ne[2]*reshape->ne[3] == ggml_nrows(xn);
+                const ggml_tensor * prev = cgraph->nodes[i + 4]; // cont
+                for (int h = 0; h < hc && chain_ok; ++h) {
+                    const ggml_tensor * view = cgraph->nodes[h == 0 ? i + 3 : i + 5 + 2*(h - 1)];
+                    const size_t offs = view->view_offs;
+                    chain_ok = view->src[0] == reshape && view->ne[0] == n_embd && ggml_nrows(view) == ggml_nrows(xn) &&
+                               view->nb[1] == (size_t) n_embd*hc*sizeof(float) && offs == (size_t) h*n_embd*sizeof(float);
+                    if (h == 0) {
+                        chain_ok = chain_ok && prev->src[0] == view;
+                    } else {
+                        const ggml_tensor * add = cgraph->nodes[i + 6 + 2*(h - 1)];
+                        chain_ok = chain_ok && add->src[0] == prev && add->src[1] == view;
+                        prev = add;
+                    }
+                }
+                chain_ok = chain_ok && scale->src[0] == prev && scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) &&
+                           scale->ne[0] == n_embd && ggml_nrows(scale) == ggml_nrows(xn);
+
+                float sc[2];
+                memcpy(sc, scale->op_params, sizeof(sc));
+
+                // thread (e, t) reads xn/y at every stream offset h*n_embd + e, which other threads'
+                // dst elements could overwrite if dst reused the (larger) xn/y buffers -> refuse any overlap
+                const bool mem_ok = chain_ok && !ggml_cuda_tensors_overlap(scale, xn) && !ggml_cuda_tensors_overlap(scale, y);
+
+                if (mem_ok && sc[1] == 0.0f) {
+                    ggml_cuda_op_hc_mix_tail(*cuda_ctx, xn, y, sc[0], scale);
+                    return n_ops - 1;
+                }
+            }
+        }
+    }
+
+    // scale -> silu | sigmoid
+    if (!(disable_hc_fusion & 4) && node->op == GGML_OP_SCALE && ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY })) {
+        ggml_tensor * unary = cgraph->nodes[i + 1];
+        const ggml_unary_op uop = ggml_get_unary_op(unary);
+        if ((uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID) && unary->src[0] == node &&
+                node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(unary)) {
+            float sc[2];
+            memcpy(sc, node->op_params, sizeof(sc));
+            // elementwise: an in-place unary over the matvec output is fine
+            if (ggml_cuda_alias_ok(unary, node->src[0], true)) {
+                ggml_cuda_op_scale_unary(*cuda_ctx, node->src[0], sc[0], sc[1], uop, unary);
+                return 1;
+            }
         }
     }
 
