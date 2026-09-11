@@ -620,11 +620,14 @@ static __global__ void mul_mat_vec_q(
     bool use_gate_bias = false;
     bool use_scale = false;
     bool use_gate_scale = false;
+    bool use_dual = false;
+    uint32_t nrows2 = 0;
     [[maybe_unused]] const void * vgate = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
     const float * x_scale = nullptr;
     const float * gate_scale = nullptr;
+    float * dst2 = nullptr;
     ggml_glu_op active_glu;
     float glu_limit = 0.0f;
 
@@ -632,6 +635,9 @@ static __global__ void mul_mat_vec_q(
         use_gate      = fusion.gate      != nullptr;
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
+        use_dual      = fusion.dst2      != nullptr && use_gate;
+        nrows2        = fusion.nrows2;
+        dst2          = (float *) fusion.dst2;
         vgate         = fusion.gate;
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
@@ -701,7 +707,7 @@ static __global__ void mul_mat_vec_q(
                 tmp[j][i] += vec_dot_q_cuda(
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
-                    if (use_gate) {
+                    if (use_gate && (!use_dual || uint32_t(row0 + i) < nrows2)) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
@@ -762,7 +768,13 @@ static __global__ void mul_mat_vec_q(
                         result *= x_scales;
                     }
                     result += x_biases[j];
-                    if (use_gate) {
+                    if (use_dual) {
+                        // second matrix: its own output, no gating
+                        if (uint32_t(row0 + i) < nrows2) {
+                            float * dst2_row = dst2 + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+                            dst2_row[j*fusion.stride_col_dst2 + i] = tmp_gate[j][i] + gate_biases[j];
+                        }
+                    } else if (use_gate) {
                         float gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4) {
                             gate_value *= gate_scales;
@@ -793,7 +805,7 @@ static __global__ void mul_mat_vec_q(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, use_dual, nrows2, dst2);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -1418,8 +1430,18 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.x_bias = fusion->x_bias->data;
         }
         if (fusion->gate) {
-            GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
+            GGML_ASSERT(fusion->gate->type == src0->type);
+            GGML_ASSERT(fusion->dst2 ? (fusion->gate->ne[0] == src0->ne[0] && fusion->gate->nb[1] == src0->nb[1]) : ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
+        }
+        if (fusion->dst2) {
+            GGML_ASSERT(fusion->gate && !ids);
+            GGML_ASSERT(fusion->dst2->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->dst2));
+            GGML_ASSERT(fusion->dst2->ne[0] == fusion->gate->ne[1] && fusion->dst2->ne[0] <= dst->ne[0]);
+            GGML_ASSERT(fusion->dst2->ne[1] == dst->ne[1] && ne12 == 1 && ne13 == 1);
+            fusion_local.dst2            = fusion->dst2->data;
+            fusion_local.nrows2          = fusion->dst2->ne[0];
+            fusion_local.stride_col_dst2 = fusion->dst2->nb[1] / ts_dst;
         }
         if (fusion->gate_bias) {
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
@@ -1455,12 +1477,21 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // quantize src1 once per graph evaluation, other matrix-vector products with the same input reuse it
+    ggml_cuda_pool_alloc<char> src1_q8_1_tmp(ctx.pool());
+    char * src1_q8_1 = ctx.q8_1_cache.find(src1, 0);
+    if (src1_q8_1 == nullptr) {
+        src1_q8_1 = ctx.q8_1_cache.add(src1, 0, ctx.device, stream, nbytes_src1_q8_1);
+        if (src1_q8_1 == nullptr) {
+            src1_q8_1 = src1_q8_1_tmp.alloc(nbytes_src1_q8_1);
+        }
+
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1490,7 +1521,7 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t ncols_chunk = n_chunks == 1 ? ncols_dst : std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, ncols_dst - col0);
 
         // MUL_MAT_ID only: the token is the column of dst / of the quantized src1 and the row of ids
-        const char    * src1_chunk = (const char *) src1_q8_1.get() + col0*stride_col_y*sizeof(block_q8_1);
+        const char    * src1_chunk = src1_q8_1 + col0*stride_col_y*sizeof(block_q8_1);
         const int32_t * ids_chunk  = ids_d ? ids_d + col0*ids_stride : nullptr;
         float         * dst_chunk  = dst_d + col0*stride_col_dst;
 

@@ -47,6 +47,7 @@
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/hc-fused.cuh"
+#include "ggml-cuda/ewchain.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
@@ -3880,6 +3881,125 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // chain of small elementwise ops on one carried tensor (e.g. add bias -> softplus -> mul, sigmoid -> mul)
+    {
+        static const bool disable_ewchain = getenv("GGML_CUDA_DISABLE_EWCHAIN") != nullptr;
+
+        auto step_of = [](const ggml_tensor * t, const ggml_tensor * carried, ggml_cuda_ewchain_step & st, const ggml_tensor ** operand) -> bool {
+            *operand = nullptr;
+            if (t->type != GGML_TYPE_F32) {
+                return false;
+            }
+            switch (t->op) {
+                case GGML_OP_ADD: case GGML_OP_SUB: case GGML_OP_MUL: case GGML_OP_DIV: {
+                    const bool commut = t->op == GGML_OP_ADD || t->op == GGML_OP_MUL;
+                    const ggml_tensor * o = nullptr;
+                    if (t->src[0] == carried) {
+                        o = t->src[1];
+                    } else if (commut && t->src[1] == carried) {
+                        o = t->src[0];
+                    } else {
+                        return false;
+                    }
+                    if (o->type != GGML_TYPE_F32 || !ggml_can_repeat(o, t) || !ggml_is_contiguous(o) || !ggml_are_same_shape(t, carried)) {
+                        return false;
+                    }
+                    for (int d = 0; d < 4; ++d) {
+                        if (o->ne[d] != 1 && o->ne[d] != t->ne[d]) {
+                            return false; // modulo broadcast not supported by the kernel
+                        }
+                    }
+                    st.kind = t->op == GGML_OP_ADD ? GGML_CUDA_EWCHAIN_ADD : t->op == GGML_OP_SUB ? GGML_CUDA_EWCHAIN_SUB :
+                              t->op == GGML_OP_MUL ? GGML_CUDA_EWCHAIN_MUL : GGML_CUDA_EWCHAIN_DIV;
+                    st.operand = (const float *) o->data;
+                    for (int d = 0; d < 4; ++d) {
+                        st.nb[d] = o->ne[d] == 1 ? 0 : (uint32_t) (o->nb[d] / sizeof(float));
+                    }
+                    *operand = o;
+                    return true;
+                }
+                case GGML_OP_SCALE: {
+                    if (t->src[0] != carried || !ggml_are_same_shape(t, carried)) {
+                        return false;
+                    }
+                    float sc[2];
+                    memcpy(sc, t->op_params, sizeof(sc));
+                    st.kind = GGML_CUDA_EWCHAIN_SCALE;
+                    st.s = sc[0];
+                    st.b = sc[1];
+                    return true;
+                }
+                case GGML_OP_UNARY: {
+                    if (t->src[0] != carried || !ggml_are_same_shape(t, carried) || !ggml_cuda_ewchain_unary_supported(ggml_get_unary_op(t))) {
+                        return false;
+                    }
+                    st.kind  = GGML_CUDA_EWCHAIN_UNARY;
+                    st.unary = ggml_get_unary_op(t);
+                    return true;
+                }
+                default:
+                    return false;
+            }
+        };
+
+        ggml_cuda_ewchain_params params{};
+        const ggml_tensor * operands[GGML_CUDA_EWCHAIN_MAX_STEPS] = {};
+        const ggml_tensor * x = nullptr;
+        int n_steps = 0;
+
+        if (!disable_ewchain && node->src[0] != nullptr && ggml_is_contiguous(node)) {
+            // the carried input of the first step is src0, unless a commutative op has it in src1
+            x = node->src[0];
+            ggml_cuda_ewchain_step st{};
+            const ggml_tensor * o = nullptr;
+            bool ok = x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_are_same_shape(node, x) && step_of(node, x, st, &o);
+            if (!ok && (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) && node->src[1] != nullptr) {
+                x  = node->src[1];
+                ok = x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_are_same_shape(node, x) && step_of(node, x, st, &o);
+            }
+            if (ok) {
+                params.steps[0] = st;
+                operands[0] = o;
+                n_steps = 1;
+                ggml_op ops[GGML_CUDA_EWCHAIN_MAX_STEPS];
+                ops[0] = node->op;
+                for (int k = 1; k < GGML_CUDA_EWCHAIN_MAX_STEPS && i + k < cgraph->n_nodes; ++k) {
+                    const ggml_tensor * t = cgraph->nodes[i + k];
+                    ggml_cuda_ewchain_step st_k{};
+                    const ggml_tensor * o_k = nullptr;
+                    if (!ggml_is_contiguous(t) || !step_of(t, cgraph->nodes[i + k - 1], st_k, &o_k)) {
+                        break;
+                    }
+                    ops[k] = t->op;
+                    const int out_nodes[1] = { i + k };
+                    if (!ggml_can_fuse_subgraph(cgraph, i, k + 1, ops, out_nodes, 1)) {
+                        break;
+                    }
+                    params.steps[k] = st_k;
+                    operands[k] = o_k;
+                    n_steps = k + 1;
+                }
+            }
+        }
+
+        // a single uniform add/mul chain is handled above; anything else with >= 2 steps is worth one kernel
+        if (n_steps >= 2) {
+            ggml_tensor * out = cgraph->nodes[i + n_steps - 1];
+            // elementwise over the same index: the output may alias the carried input, but not a broadcast operand
+            bool mem_ok = ggml_cuda_alias_ok(out, x, true);
+            for (int k = 0; k < n_steps && mem_ok; ++k) {
+                if (operands[k] != nullptr) {
+                    mem_ok = !ggml_cuda_tensors_overlap(out, operands[k]);
+                }
+            }
+            if (mem_ok) {
+                params.n_steps = n_steps;
+                ggml_cuda_op_ewchain(*cuda_ctx, x, out, params);
+                return n_steps - 1;
+            }
+        }
+    }
+
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 
@@ -4228,6 +4348,93 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // two matrix-vector products with the same input (e.g. the qkv and gate projections of a layer): one
+    // launch reads the quantized input once and keeps more of the device busy than two small products one
+    // after the other. The partner may be further down the graph (the graph is built depth-first from the
+    // outputs, so a product consumed late is placed late); it is computed here and skipped later. That is
+    // safe when no tensor used by the nodes in between lives in the memory of the partner's output.
+    static const bool disable_dual = getenv("GGML_CUDA_DISABLE_DUAL_MMVQ") != nullptr;
+    if (!disable_dual && node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+        const int k_max = std::min(cgraph->n_nodes, i + 128);
+        for (int k = i + 1; k < k_max; ++k) {
+            ggml_tensor * other = cgraph->nodes[k];
+
+            if (other->op != GGML_OP_MUL_MAT || other->src[1] != node->src[1]) {
+                continue;
+            }
+
+            const bool ok = other->src[2] == nullptr &&
+                (other->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                std::find(cuda_ctx->nodes_computed_early.begin(), cuda_ctx->nodes_computed_early.end(), k) == cuda_ctx->nodes_computed_early.end() &&
+                other->src[0]->type  == node->src[0]->type  &&
+                other->src[0]->ne[0] == node->src[0]->ne[0] &&
+                other->src[0]->nb[1] == node->src[0]->nb[1] &&
+                other->src[0]->ne[2] == 1 && other->src[0]->ne[3] == 1 &&
+                node->src[0]->ne[2]  == 1 && node->src[0]->ne[3]  == 1 &&
+                other->ne[1] == 1 && other->ne[2] == 1 && other->ne[3] == 1 &&
+                node->ne[1]  == 1 && node->ne[2]  == 1 && node->ne[3]  == 1 &&
+                ggml_is_contiguous(other) && ggml_is_contiguous(node) &&
+                other->buffer && other->data &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(other);
+
+            // a partner much smaller than the main matrix gains little and slows the main product down
+            const int64_t n_big   = std::max(node->ne[0], other->ne[0]);
+            const int64_t n_small = std::min(node->ne[0], other->ne[0]);
+
+            if (!ok || 4*n_small < n_big) {
+                continue; // another product with the same input may follow (e.g. an f32 router in between)
+            }
+
+            // the partner's output is written now: nothing computed or read between the two nodes may share its memory
+            const int64_t o_start = (int64_t) other->data;
+            const int64_t o_end   = o_start + ggml_backend_buft_get_alloc_size(other->buffer->buft, other);
+            auto overlaps = [&](const ggml_tensor * t) {
+                if (t == nullptr || t == other || t->buffer == nullptr || t->data == nullptr) {
+                    return false;
+                }
+                const int64_t t_start = (int64_t) t->data;
+                const int64_t t_end   = t_start + ggml_nbytes(t);
+                return t_start < o_end && o_start < t_end;
+            };
+
+            bool safe = !overlaps(node);
+            for (int m = i + 1; m < k && safe; ++m) {
+                const ggml_tensor * t = cgraph->nodes[m];
+                safe = safe && !overlaps(t);
+                for (int j = 0; j < GGML_MAX_SRC && safe; ++j) {
+                    safe = safe && !overlaps(t->src[j]);
+                }
+            }
+
+            if (!safe) {
+                continue;
+            }
+
+            ggml_tensor * big   = node;
+            ggml_tensor * small = other;
+            if (other->ne[0] > node->ne[0]) {
+                std::swap(big, small);
+            }
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.gate = small->src[0];
+            fusion_data.dst2 = small;
+
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, big->src[0], big->src[1], nullptr, big, &fusion_data);
+
+            bool only_noops_between = true;
+            for (int m = i + 1; m < k && only_noops_between; ++m) {
+                only_noops_between = ggml_cuda_is_view_or_noop(cgraph->nodes[m]);
+            }
+            if (only_noops_between) {
+                return k - i;
+            }
+            // the partner is skipped when the evaluation reaches it; this node is done
+            cuda_ctx->nodes_computed_early.push_back(k);
+            return -1;
+        }
+    }
+
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
@@ -4431,6 +4638,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    // quantized activations are shared only within this evaluation
+    cuda_ctx->q8_1_cache.reset();
+    cuda_ctx->nodes_computed_early.clear();
+    struct q8_1_cache_reset { ggml_cuda_q8_1_cache & c; ~q8_1_cache_reset() { c.reset(); } } q8_1_cache_guard{cuda_ctx->q8_1_cache};
+
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4570,7 +4782,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (!cuda_ctx->nodes_computed_early.empty() &&
+                        std::find(cuda_ctx->nodes_computed_early.begin(), cuda_ctx->nodes_computed_early.end(), i) != cuda_ctx->nodes_computed_early.end()) {
+                    continue;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (nodes_to_skip < 0) {
+                    // the node was computed together with a node further down, which is skipped when reached
+                    continue;
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG

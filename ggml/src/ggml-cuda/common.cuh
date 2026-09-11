@@ -1418,6 +1418,85 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Cache of the q8_1 quantization of activations within one graph evaluation. Several matrix-vector
+// products often share the same input (q/k/v/gate projections, MoE and shared-expert gate/up, the
+// hyper-connection projections): without the cache every one of them re-quantizes it. Entries are keyed
+// by the tensor object and its data pointer, which identify the same data within one graph evaluation;
+// the cache is cleared at the start and at the end of every graph evaluation.
+struct ggml_cuda_q8_1_cache {
+    struct entry {
+        const ggml_tensor * src1;
+        const void *        data;
+        int64_t             ne[GGML_MAX_DIMS];
+        size_t              nb[GGML_MAX_DIMS];
+        int                 layout; // 0 = mmvq q8_1, otherwise the MMQ q8_1 ds layout + 1
+        char *              buf;
+    };
+
+    std::vector<entry> entries;
+
+    // the entries live in a dedicated arena (bump allocated per graph evaluation): the pool is a stack,
+    // and a buffer kept across the other allocations of the ops in between would break its order
+    char * arena = nullptr;
+    size_t arena_size = 0;
+    size_t arena_used = 0;
+
+    static constexpr size_t ARENA_SIZE = 64u*1024*1024;
+
+    ~ggml_cuda_q8_1_cache() {
+        if (arena != nullptr) {
+            cudaFree(arena);
+        }
+    }
+
+    void reset() {
+        entries.clear();
+        arena_used = 0;
+    }
+
+    char * find(const ggml_tensor * src1, int layout) const {
+        for (const auto & e : entries) {
+            if (e.src1 == src1 && e.data == src1->data && e.layout == layout &&
+                    memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0) {
+                return e.buf;
+            }
+        }
+        return nullptr;
+    }
+
+    // returns nullptr when the entry cannot be cached (arena exhausted, or not allocated yet while capturing)
+    char * add(const ggml_tensor * src1, int layout, int device, cudaStream_t stream, size_t size) {
+        if (arena == nullptr) {
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(stream, &status);
+            if (status != cudaStreamCaptureStatusNone) {
+                return nullptr;
+            }
+            ggml_cuda_set_device(device);
+            if (cudaMalloc(&arena, ARENA_SIZE) != cudaSuccess) {
+                cudaGetLastError();
+                arena = nullptr;
+                return nullptr;
+            }
+            arena_size = ARENA_SIZE;
+        }
+        const size_t aligned = (size + 255) & ~size_t(255);
+        if (arena_used + aligned > arena_size) {
+            return nullptr;
+        }
+        entry e;
+        e.src1 = src1;
+        e.data = src1->data;
+        memcpy(e.ne, src1->ne, sizeof(e.ne));
+        memcpy(e.nb, src1->nb, sizeof(e.nb));
+        e.layout = layout;
+        e.buf = arena + arena_used;
+        arena_used += aligned;
+        entries.push_back(e);
+        return e.buf;
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1435,6 +1514,12 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
     int graph_ring_cur = 0; // ring slot used by the next large multi-row graph (prompt processing)
+
+    ggml_cuda_q8_1_cache q8_1_cache;
+
+    // nodes of the current graph evaluation already computed as part of an earlier node's launch
+    // (dual matrix-vector products), skipped when the evaluation reaches them
+    std::vector<int> nodes_computed_early;
     // classification of the last graph seen (by uid): its maximum number of rows and, for small
     // multi-row graphs, its hash key
     uint64_t     graph_class_uid  = 0;
@@ -1552,6 +1637,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // dual output: `gate` is a second weight matrix sharing the input, its product is written to dst2
+    // (no GLU). gate may have fewer rows than the main matrix.
+    const ggml_tensor * dst2 = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1561,6 +1649,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    void *   dst2 = nullptr;
+    uint32_t nrows2 = 0;
+    uint32_t stride_col_dst2 = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

@@ -692,6 +692,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
+    // place the two projections of the same input next to each other in the graph (z is consumed only at
+    // the end of the block, so the depth-first build would put it there): the CUDA backend then runs them
+    // as one dual matrix-vector product
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+
     return { qkv_mixed, z };
 }
 
@@ -1044,6 +1050,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
     cb(Vcur, "Vcur", il);
+
+    // adjacent in the graph, so that the backend can run the two projections of the same input together
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, Vcur);
 
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
