@@ -128,6 +128,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_ns(uint32_t n_seqs) override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -356,9 +357,10 @@ public:
     // used for errors
     llama_kv_cache_context(llama_memory_status status);
 
-    // used to create a full-cache context
+    // used to create a full-cache context (n_stream_req streams, 0 = all streams of the cache)
     llama_kv_cache_context(
-            llama_kv_cache * kv);
+            llama_kv_cache * kv,
+            uint32_t n_stream_req = 0);
 
     // used to create an update context
     llama_kv_cache_context(
@@ -390,6 +392,9 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // capacity of the cache (upper bound of get_n_kv()), for inputs that must keep a fixed allocation
+    uint32_t get_size() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

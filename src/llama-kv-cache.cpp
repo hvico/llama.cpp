@@ -740,6 +740,15 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache::init_full_ns(uint32_t n_seqs) {
+    // a unified cache is always a single stream; otherwise the ubatch spans n_seqs streams
+    const uint32_t n_stream_req = n_stream == 1 ? 1 : n_seqs;
+    if (n_stream_req == 0 || n_stream_req > n_stream) {
+        return nullptr;
+    }
+    return std::make_unique<llama_kv_cache_context>(this, n_stream_req);
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
@@ -2662,10 +2671,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+        llama_kv_cache * kv,
+        uint32_t n_stream_req) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
-    const uint32_t n_stream = kv->get_n_stream();
+    const uint32_t n_stream = n_stream_req == 0 ? kv->get_n_stream() : n_stream_req;
+    GGML_ASSERT(n_stream <= kv->get_n_stream());
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
     sinfos.resize(1);
@@ -2734,6 +2745,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_size() const {
+    return kv->get_size();
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

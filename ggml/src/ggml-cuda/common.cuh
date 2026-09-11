@@ -1232,6 +1232,10 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
+        if (launch_event != nullptr) {
+            CUDA_CHECK(cudaEventSynchronize(launch_event));
+            CUDA_CHECK(cudaEventDestroy(launch_event));
+        }
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
@@ -1241,6 +1245,7 @@ struct ggml_cuda_graph {
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    cudaEvent_t launch_event = nullptr; // recorded after each launch of a ring slot graph (see ggml_cuda_graph_get_key)
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1429,6 +1434,12 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    int graph_ring_cur = 0; // ring slot used by the next large multi-row graph (prompt processing)
+    // classification of the last graph seen (by uid): its maximum number of rows and, for small
+    // multi-row graphs, its hash key
+    uint64_t     graph_class_uid  = 0;
+    int64_t      graph_class_rows = 1;
+    const void * graph_class_key  = nullptr;
 
     int64_t last_graph_eviction_sweep = 0;
 

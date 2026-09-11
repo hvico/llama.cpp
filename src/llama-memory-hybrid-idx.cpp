@@ -132,6 +132,14 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid_idx::init_full_ns(uint32_t n_seqs) {
+    auto res = std::make_unique<llama_memory_hybrid_idx_context>(this, n_seqs);
+    if (res->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        return nullptr;
+    }
+    return res;
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
@@ -612,6 +620,14 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx())) {}
+
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_seqs) :
+    llama_memory_hybrid_context(mem, n_seqs),
+    mem(mem),
+    ns_ubatch(mem->get_mem_idx() == nullptr ?
+        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() == 1 ? 1u : n_seqs }),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx(), mem->get_mem_idx()->get_n_stream() == 1 ? 1u : n_seqs)) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,

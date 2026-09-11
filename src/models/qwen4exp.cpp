@@ -801,16 +801,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     } else {
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
 
-        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        // The input buffers are allocated for the full cache (n_kv_max) and the graph consumes
+        // compact views sized by the current n_kv: the allocation of every graph input then stays
+        // constant across ubatches, which is what keeps ggml_backend_sched from reallocating (and
+        // synchronizing every backend) as n_kv grows during a prompt. That reallocation serialized
+        // the pipeline-parallel prefill across the GPUs.
+        const int64_t n_kv_max     = std::max<int64_t>(n_kv, mctx_idx->get_size());
+        const int64_t n_blocks_max = (n_kv_max + r - 1)/r;
+        const int64_t n_bias_max   = blk_bias ? n_blocks_max : n_kv_max;
 
-        ggml_set_input(qsa->cell_blk);
-        ggml_set_input(qsa->blk_cells);
-        ggml_set_input(qsa->blk_pos);
-        ggml_set_input(qsa->bias);
+        ggml_tensor * cell_blk_buf  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv_max*n_stream);
+        ggml_tensor * blk_cells_buf = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*n_blocks_max*n_stream);
+        ggml_tensor * blk_pos_buf   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks_max*n_stream);
+        ggml_tensor * bias_buf      = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_bias_max*n_tps*n_stream);
+
+        ggml_set_input(cell_blk_buf);
+        ggml_set_input(blk_cells_buf);
+        ggml_set_input(blk_pos_buf);
+        ggml_set_input(bias_buf);
+
+        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+        qsa->cell_blk  = ggml_view_2d(ctx0, cell_blk_buf,  n_kv,       n_stream, n_kv*sizeof(int32_t),       0);
+        qsa->blk_cells = ggml_view_2d(ctx0, blk_cells_buf, r*n_blocks, n_stream, r*n_blocks*sizeof(int32_t), 0);
+        qsa->blk_pos   = ggml_view_1d(ctx0, blk_pos_buf,   4*n_blocks*n_stream, 0);
+        qsa->bias      = ggml_view_3d(ctx0, bias_buf, blk_bias ? n_blocks : n_kv, n_tps, n_stream,
+                                      (blk_bias ? n_blocks : n_kv)*sizeof(float), (blk_bias ? n_blocks : n_kv)*n_tps*sizeof(float), 0);
 
         inp = qsa.get();
         res->add_input(std::move(qsa));

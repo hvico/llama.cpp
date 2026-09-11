@@ -53,6 +53,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_ns(uint32_t n_seqs) override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -99,6 +100,9 @@ public:
 
     // init full
     explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
+
+    // init full for a ubatch spanning n_seqs sequences (see llama_memory_i::init_full_ns)
+    llama_memory_hybrid_context(llama_memory_hybrid * mem, uint32_t n_seqs);
 
     // init update
     explicit llama_memory_hybrid_context(

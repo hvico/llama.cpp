@@ -378,6 +378,9 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // set by decode(): the current call spans several ubatches (pipeline-parallel prefill)
+    bool multi_ubatch_decode = false;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

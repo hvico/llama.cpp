@@ -2594,14 +2594,95 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+// Multi-row graphs (prompt processing) are captured as CUDA graphs too: without them the host has to issue
+// every kernel of a ubatch and blocks on the launch queue, which serializes pipeline-parallel prefill
+// across the GPUs. They skip the two-call warmup because a capture that is used only once still costs
+// less than launching the ubatch kernel by kernel. Two policies, by the number of rows of the graph:
+//  - small (<= GGML_CUDA_GRAPH_RING_MIN_ROWS rows, e.g. speculative verification batches): one cached graph
+//    per variant, keyed on the first node plus a hash of the source pointers and shapes, so that a
+//    recurring batch shape is launched without a capture.
+//  - large (prompt ubatches): the shapes change with every ubatch (the KV length grows), so a per-variant
+//    cache would instantiate a new executable graph for every ubatch, and cudaGraphInstantiate allocates
+//    device memory, which synchronizes the device and drains the pipeline. Instead a small ring of graphs
+//    is reused: the slot is re-captured every time and its executable is updated in place
+//    (cudaGraphExecUpdate, re-instantiated only when the topology changes). Before a slot is re-captured
+//    the host waits for the completion of its previous launch, so the update never touches a running graph.
+// GGML_CUDA_PP_GRAPHS=0 restores the previous behaviour (no graphs for multi-row batches).
+#define GGML_CUDA_GRAPH_RING_SLOTS    4
+#define GGML_CUDA_GRAPH_RING_MIN_ROWS 64
+
+// the classification of a graph (and its hash key) is cached by graph uid: a reused graph (e.g. token
+// generation) is classified once instead of walking all nodes on every compute call
+static int64_t ggml_cuda_graph_max_rows(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    static const bool pp_graphs = getenv("GGML_CUDA_PP_GRAPHS") == nullptr || atoi(getenv("GGML_CUDA_PP_GRAPHS")) != 0;
+    if (!pp_graphs) {
+        return 1;
+    }
+    if (cgraph->uid != 0 && cgraph->uid == cuda_ctx->graph_class_uid) {
+        return cuda_ctx->graph_class_rows;
+    }
+    // the number of tokens of the batch: MUL_MAT_ID (MoE) has one row per token, while a MUL_MAT may
+    // have several rows per token (e.g. per head), so it is only used when there is no MUL_MAT_ID
+    int64_t rows_mm   = 1;
+    int64_t rows_mmid = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_MUL_MAT) {
+            rows_mm = std::max(rows_mm, n->ne[1]);
+        } else if (n->op == GGML_OP_MUL_MAT_ID) {
+            rows_mmid = std::max(rows_mmid, n->ne[2]);
+        }
+    }
+    const int64_t rows = rows_mmid > 0 ? rows_mmid : rows_mm;
+    cuda_ctx->graph_class_uid  = cgraph->uid;
+    cuda_ctx->graph_class_rows = rows;
+    cuda_ctx->graph_class_key  = nullptr;
+    return rows;
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_is_multi_row(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    return ggml_cuda_graph_max_rows(cuda_ctx, cgraph) > 1;
+}
+
+static bool ggml_cuda_graph_is_ring_key(const void * key) {
+    const uintptr_t k = (uintptr_t) key;
+    return k >= 0x101 && k < 0x101 + 2*GGML_CUDA_GRAPH_RING_SLOTS;
+}
+
+static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    const int64_t rows = ggml_cuda_graph_max_rows(cuda_ctx, cgraph);
+    if (rows <= 1) {
+        return cgraph->nodes[0];
+    }
+    if (rows > GGML_CUDA_GRAPH_RING_MIN_ROWS) {
+        // odd small integers never collide with a real (aligned) node pointer
+        return (const void *) (uintptr_t) (0x101 + 2*cuda_ctx->graph_ring_cur);
+    }
+    if (cgraph->uid != 0 && cgraph->uid == cuda_ctx->graph_class_uid && cuda_ctx->graph_class_key != nullptr) {
+        return cuda_ctx->graph_class_key;
+    }
+    uint64_t h = (uint64_t) (uintptr_t) cgraph->nodes[0];
+    auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        mix((uint64_t) n->op);
+        mix((uint64_t) (uintptr_t) n->data);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix((uint64_t) n->ne[d]);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (n->src[j]) {
+                mix((uint64_t) (uintptr_t) n->src[j]->data);
+            }
+        }
+    }
+    cuda_ctx->graph_class_key = (const void *) (uintptr_t) (h | 1);
+    return cuda_ctx->graph_class_key;
+}
+
+static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const void * graph_key) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -3114,7 +3195,10 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
     const int     n_expert_used = (int) weighted->ne[1];
     const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
-    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens <= 0) {
+    // n_tokens == 0 (a ubatch without outputs after the get_rows of the last layer) is matched too, so that the
+    // graph topology (the alloc-dep node added by graph_optimize) does not depend on the number of outputs;
+    // otherwise every prefill ubatch reallocates the scheduler graph, which serializes pipeline parallelism
+    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens < 0) {
         return false;
     }
 
@@ -4557,12 +4641,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-        }
-        if (cuda_graph_update_required) { // Update graph executable
+        } else if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (ggml_cuda_graph_is_ring_key(graph_key)) {
+            if (graph->launch_event == nullptr) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&graph->launch_event, cudaEventDisableTiming));
+            }
+            CUDA_CHECK(cudaEventRecord(graph->launch_event, cuda_ctx->stream()));
+            cuda_ctx->graph_ring_cur = (cuda_ctx->graph_ring_cur + 1) % GGML_CUDA_GRAPH_RING_SLOTS;
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -4597,7 +4687,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -4605,8 +4695,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
 
+            if (ggml_cuda_graph_is_multi_row(cuda_ctx, cgraph)) {
+                // prompt processing: capture immediately, no warmup
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+                if (cuda_graph_update_required && ggml_cuda_graph_is_ring_key(graph_key) && graph->launch_event != nullptr) {
+                    // the slot is re-captured and its executable updated: its previous launch must be complete
+                    CUDA_CHECK(cudaEventSynchronize(graph->launch_event));
+                }
+            } else
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
@@ -4697,7 +4796,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;

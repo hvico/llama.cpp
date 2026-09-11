@@ -55,6 +55,9 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     const int64_t n_embd        = experts->ne[0];
     const int64_t n_expert_used = experts->ne[1];
     const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
+    if (n_tokens == 0) {
+        return; // empty ubatch (no output rows)
+    }
     cudaStream_t  stream        = ctx.stream();
 
     launch_moe_weighted_reduction((const float *) experts->data,

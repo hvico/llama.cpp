@@ -93,6 +93,14 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // simulate a full cache for a ubatch that spans n_seqs sequences (n_seqs streams when the cache is
+    // not unified), used to reserve the worst case of that ubatch shape at runtime.
+    // returns nullptr when the memory type does not support it
+    virtual llama_memory_context_ptr init_full_ns(uint32_t n_seqs) {
+        GGML_UNUSED(n_seqs);
+        return nullptr;
+    }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;

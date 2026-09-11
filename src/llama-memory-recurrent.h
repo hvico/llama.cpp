@@ -38,6 +38,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_ns(uint32_t n_seqs) override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 

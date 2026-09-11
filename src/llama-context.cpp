@@ -1345,7 +1345,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // With pipeline parallelism, reusing the graph for a multi-token ubatch would require a full
+    // synchronization before set_inputs (see below), which prevents the next ubatch from being
+    // queued while the previous one is still running on the other GPUs. Rebuilding the graph
+    // (a few ms) lets the scheduler rotate its input copies and overlap the ubatches instead.
+    const bool reuse_ok = !graph_reuse_disable && !(cparams.pipeline_parallel && multi_ubatch_decode);
+
+    if (reuse_ok && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1374,10 +1380,51 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const size_t n_reallocs = ggml_backend_sched_get_n_reallocs(sched.get());
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        if (cparams.pipeline_parallel && multi_ubatch_decode && memory &&
+                ggml_backend_sched_get_n_reallocs(sched.get()) != n_reallocs) {
+            // The scheduler reallocated its compute buffers for this ubatch (the graph topology or the input
+            // sizes changed since the last reserve, e.g. after a single-token graph or a ubatch with a
+            // different number of sequences). The buffers are now sized exactly for this ubatch, so every
+            // later ubatch of the batch (the KV-dependent inputs grow with each one) would reallocate again,
+            // and each reallocation synchronizes all backends, serializing the pipeline-parallel prefill.
+            // Reserve once with the worst case for this ubatch shape and rebuild the graph, so that the
+            // rest of the batch fits without reallocations.
+            LLAMA_LOG_DEBUG("%s: graph reallocated during a pipelined batch, reserving worst case (n_seqs = %u)\n", __func__, ubatch.n_seqs);
+
+            const uint32_t n_seqs_ws    = ubatch.n_seqs;
+            const uint32_t n_tokens_ws  = std::min(cparams.n_ctx, cparams.n_ubatch);
+            const uint32_t n_outputs_ws = std::min(n_tokens_ws, cparams.n_outputs_max);
+
+            auto mctx_full = memory->init_full_ns(n_seqs_ws);
+            if (!mctx_full) {
+                LLAMA_LOG_DEBUG("%s: the memory module cannot simulate a full cache for %u sequences\n", __func__, n_seqs_ws);
+            } else {
+                if (!graph_reserve(n_tokens_ws, n_seqs_ws, n_outputs_ws, mctx_full.get())) {
+                    LLAMA_LOG_WARN("%s: failed to reserve the worst-case graph\n", __func__);
+                }
+
+                // graph_reserve resets the scheduler and the previous graph result: rebuild the ubatch graph
+                res->reset();
+
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+                gf = model.build_graph(gparams);
+
+                if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+            }
         }
     }
 
@@ -1469,6 +1516,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
+    multi_ubatch_decode = false;
+
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
     cparams.causal_attn = causal_attn_org;
@@ -1722,6 +1771,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
+
+    // more than one ubatch in this call: the ubatches can overlap across the pipeline stages
+    multi_ubatch_decode = n_tokens_all > cparams.n_ubatch;
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed

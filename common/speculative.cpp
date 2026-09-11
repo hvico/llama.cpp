@@ -1580,6 +1580,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+            if (n_rows > this->params.n_max + 1) {
+                // a prompt batch: accept() only reads back verification batches (sampled token + draft),
+                // so keep just the last row, the pending h for the next draft
+                verify_h_rows[seq_id] = 0;
+                std::memcpy(pending_h[seq_id].data(), llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]), row_bytes);
+                continue;
+            }
+
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 

@@ -51,6 +51,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_ns(uint32_t n_seqs) override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -108,6 +109,9 @@ public:
 
     // used to create a full-cache context
     explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
+
+    // used to create a full-cache context for a ubatch spanning n_seqs sequences
+    llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_seqs);
 
     // used to create an update context
     llama_memory_hybrid_idx_context(

@@ -838,6 +838,9 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // number of compute buffer reallocations at runtime (ggml_backend_sched_alloc_splits)
+    size_t n_reallocs;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1623,6 +1626,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
+        sched->n_reallocs++;
 
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
@@ -1682,8 +1686,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            // Tensors living in host memory (user inputs, views of user inputs and tensors computed by the
+            // CPU backend) are copied immediately: the destination copy slot is free once the split backend
+            // has finished its previous use of it (the event), and the source is complete because the host
+            // backends compute synchronously. The generic async fallback would instead synchronize the
+            // destination backend, which drains its queue and serializes pipeline-parallel execution.
+            const bool from_host = input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer);
+
+            if (input->flags & GGML_TENSOR_FLAG_INPUT || from_host) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                if (from_host && !(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    ggml_backend_synchronize(input_backend);
+                }
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
@@ -1880,6 +1894,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    // initialized once here; ggml_backend_sched_reset only clears the slots that were used
+    memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -1954,9 +1971,17 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
     if (!sched->is_reset) {
+        // only the hash slots that were used since the last reset can hold stale data; clearing just those
+        // instead of the whole tables matters for large graphs with pipeline parallelism (the copies table
+        // is hash_size * n_backends * n_copies pointers, tens of MB per graph)
+        const size_t stride = (size_t) sched->n_backends * sched->n_copies;
+        for (size_t i = 0; i < sched->hash_set.size; ++i) {
+            if (ggml_bitset_get(sched->hash_set.used, i)) {
+                sched->hv_tensor_backend_ids[i] = -1;
+                memset(sched->hv_tensor_copies + i*stride, 0, stride * sizeof(struct ggml_tensor *));
+            }
+        }
         ggml_hash_set_reset(&sched->hash_set);
-        memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         sched->is_reset = true;
     }
     sched->is_alloc = false;
@@ -2060,6 +2085,11 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
+}
+
+size_t ggml_backend_sched_get_n_reallocs(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_reallocs;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
