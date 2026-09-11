@@ -88,6 +88,11 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    // the nextn embeddings of the previous decode call (unmasked mode keeps two buffers): waits only for
+    // the copies of that call, not for the computation queued since
+    float * get_embeddings_nextn_prev();
+    float * get_embeddings_nextn_prev_ith(int32_t i);
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -154,6 +159,9 @@ struct llama_context {
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+
+    // complete the asynchronous sequence state reads (LLAMA_STATE_SEQ_FLAGS_ASYNC) that are still pending
+    void state_reads_flush();
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     bool state_load_file(
@@ -300,6 +308,15 @@ private:
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
 
+    // unmasked nextn embeddings are double-buffered per decode call: embd_nextn is the half written by the
+    // current call, the other half keeps the previous call's rows until the next call; each half has an
+    // event recorded after its last device -> host copy
+    buffer_view<float>     embd_nextn_half[2] = {{nullptr, 0}, {nullptr, 0}};
+    ggml_backend_event_ptr embd_nextn_event[2];
+    int64_t                embd_nextn_n_rows[2] = {0, 0};
+    int                    embd_nextn_cur = 0;
+    std::vector<float>     nextn_prev_saved; // previous rows kept across an output buffer reallocation
+
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
@@ -380,6 +397,19 @@ private:
 
     // set by decode(): the current call spans several ubatches (pipeline-parallel prefill)
     bool multi_ubatch_decode = false;
+
+    // asynchronous sequence state reads (LLAMA_STATE_SEQ_FLAGS_ASYNC): the state is read into a pinned
+    // staging buffer behind the queued computation and copied to the caller's buffer at the next flush
+    struct state_read_pending {
+        uint8_t * dst;
+        size_t    size;
+        ggml_backend_buffer_ptr staging;
+        std::vector<ggml_backend_event_ptr> events;
+    };
+    std::vector<state_read_pending>      state_reads;
+    std::vector<ggml_backend_buffer_ptr> state_staging_pool;
+
+    size_t state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags);
 
     // perf
     mutable int64_t t_start_us  = 0;

@@ -16,6 +16,8 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -718,6 +720,8 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    state_reads_flush();
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -948,6 +952,42 @@ float * llama_context::get_embeddings_nextn() {
     output_reorder();
 
     return embd_nextn.data;
+}
+
+float * llama_context::get_embeddings_nextn_prev() {
+    if (cparams.embeddings_nextn_masked || !embd_nextn_half[0].data) {
+        // single buffer: the previous call's rows were overwritten
+        synchronize();
+        return get_embeddings_nextn();
+    }
+
+    const int prev = embd_nextn_cur ^ 1;
+    if (embd_nextn_event[prev]) {
+        ggml_backend_event_synchronize(embd_nextn_event[prev].get());
+    }
+
+    return embd_nextn_half[prev].data;
+}
+
+float * llama_context::get_embeddings_nextn_prev_ith(int32_t i) {
+    if (cparams.embeddings_nextn_masked || !embd_nextn_half[0].data) {
+        synchronize();
+        return get_embeddings_nextn_ith(i);
+    }
+
+    const int prev = embd_nextn_cur ^ 1;
+    const uint32_t n_embd = model.hparams.n_embd_out();
+
+    if (i < 0 || (int64_t) i >= embd_nextn_n_rows[prev]) {
+        LLAMA_LOG_ERROR("%s: invalid nextn embeddings id %d, previous call had %" PRId64 " rows\n", __func__, i, embd_nextn_n_rows[prev]);
+        return nullptr;
+    }
+
+    if (embd_nextn_event[prev]) {
+        ggml_backend_event_synchronize(embd_nextn_event[prev].get());
+    }
+
+    return embd_nextn_half[prev].data + (size_t) i * n_embd;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
@@ -1841,11 +1881,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    // unmasked nextn embeddings: this call writes the other half, the previous call's rows stay readable
+    const bool nextn_double = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    if (nextn_double) {
+        embd_nextn_cur ^= 1;
+        embd_nextn_n_rows[embd_nextn_cur] = 0;
+    }
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+
+    ggml_backend_t backend_nextn = nullptr; // backend of the last nextn copy of this call
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -2015,6 +2064,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+
+                backend_nextn = backend_h;
+                if (nextn_double) {
+                    embd_nextn_n_rows[embd_nextn_cur] = offset + n_rows;
+                }
             }
         }
 
@@ -2085,6 +2139,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // mark the end of this call's nextn copies, so that the rows can be waited for without a full synchronization
+    if (nextn_double && backend_nextn != nullptr) {
+        auto & event = embd_nextn_event[embd_nextn_cur];
+        if (!event) {
+            event.reset(ggml_backend_event_new(ggml_backend_get_device(backend_nextn)));
+        }
+        if (event) {
+            ggml_backend_event_record(event.get(), backend_nextn);
+        }
+    }
+
+    // asynchronous state reads enqueued before this batch complete while the batch runs
+    state_reads_flush();
+
     return 0;
 }
 
@@ -2121,9 +2189,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
 
-    if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
+    const bool nextn_double = has_embd_nextn && !cparams.embeddings_nextn_masked;
+
+    if (nextn_double) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
+        // two halves: the current call's rows and the previous call's rows
         embd_nextn.size = (size_t) n_embd_out * n_batch;
     }
 
@@ -2147,8 +2218,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (                                                                         backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + (nextn_double ? 2 : 1)*embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (                                                                                                backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2160,11 +2231,22 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 #endif
             synchronize();
 
+            // keep the previous call's nextn rows across the reallocation (the caller may still read them)
+            if (nextn_double && embd_nextn_half[embd_nextn_cur ^ 1].data && embd_nextn_n_rows[embd_nextn_cur ^ 1] > 0) {
+                const auto & prev = embd_nextn_half[embd_nextn_cur ^ 1];
+                if (embd_nextn_event[embd_nextn_cur ^ 1]) {
+                    ggml_backend_event_synchronize(embd_nextn_event[embd_nextn_cur ^ 1].get());
+                }
+                nextn_prev_saved.assign(prev.data, prev.data + std::min<size_t>(prev.size, (size_t) embd_nextn_n_rows[embd_nextn_cur ^ 1]*n_embd_out));
+            }
+
             // TODO: not needed?
             buf_output = nullptr;
             logits.data = nullptr;
             embd.data = nullptr;
             embd_nextn.data = nullptr;
+            embd_nextn_half[0].data = nullptr;
+            embd_nextn_half[1].data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
             }
@@ -2196,8 +2278,22 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
 
-    embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
-    offset += embd_nextn.size * sizeof(float);
+    if (nextn_double) {
+        embd_nextn_half[0] = buffer_view<float>{(float *) (base + offset), embd_nextn.size};
+        offset += embd_nextn.size * sizeof(float);
+        embd_nextn_half[1] = buffer_view<float>{(float *) (base + offset), embd_nextn.size};
+        offset += embd_nextn.size * sizeof(float);
+
+        if (!nextn_prev_saved.empty()) {
+            memcpy(embd_nextn_half[embd_nextn_cur ^ 1].data, nextn_prev_saved.data(), nextn_prev_saved.size()*sizeof(float));
+            nextn_prev_saved.clear();
+        }
+
+        embd_nextn = embd_nextn_half[embd_nextn_cur];
+    } else {
+        embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
+        offset += embd_nextn.size * sizeof(float);
+    }
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -2781,6 +2877,63 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// writes the state into a pinned host buffer; tensor data is read asynchronously on the backend that owns
+// the tensor, ordered behind the computation queued on it (see LLAMA_STATE_SEQ_FLAGS_ASYNC)
+class llama_io_write_stage : public llama_io_write_i {
+public:
+    using backend_lookup = std::function<ggml_backend_t(const ggml_tensor *)>;
+
+    llama_io_write_stage(uint8_t * p, size_t len, backend_lookup lookup) : ptr(p), buf_size(len), lookup(std::move(lookup)) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        ggml_backend_t backend = lookup(tensor);
+        if (backend == nullptr) {
+            throw std::runtime_error("no backend for tensor " + std::string(ggml_get_name(tensor)));
+        }
+
+        ggml_backend_tensor_get_async(backend, tensor, ptr, offset, size);
+
+        if (std::find(backends.begin(), backends.end(), backend) == backends.end()) {
+            backends.push_back(backend);
+        }
+
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+    // backends with reads in flight
+    const std::vector<ggml_backend_t> & used_backends() const {
+        return backends;
+    }
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+
+    backend_lookup lookup;
+    std::vector<ggml_backend_t> backends;
+};
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -3116,6 +3269,8 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
+
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
         io.write(&io_magic, sizeof(io_magic));
@@ -3129,6 +3284,11 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+        return state_seq_get_data_async(seq_id, dst, size, flags & ~LLAMA_STATE_SEQ_FLAGS_ASYNC);
+    }
+    flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
+
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -3147,7 +3307,98 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 }
 
+size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    // pinned host memory is required for the reads to be asynchronous
+    ggml_backend_buffer_type_t host_buft = model.devices.empty() ? nullptr : ggml_backend_dev_host_buffer_type(model.devices[0].dev);
+    if (host_buft == nullptr) {
+        synchronize();
+        return state_seq_get_data(seq_id, dst, size, flags);
+    }
+
+    state_read_pending pending;
+    pending.dst  = dst;
+    pending.size = size;
+
+    // reuse a staging buffer that is large enough
+    for (auto it = state_staging_pool.begin(); it != state_staging_pool.end(); ++it) {
+        if (ggml_backend_buffer_get_size(it->get()) >= size) {
+            pending.staging = std::move(*it);
+            state_staging_pool.erase(it);
+            break;
+        }
+    }
+    if (!pending.staging) {
+        pending.staging.reset(ggml_backend_buft_alloc_buffer(host_buft, size));
+        if (!pending.staging) {
+            LLAMA_LOG_WARN("%s: failed to allocate a %.2f MiB staging buffer, reading the state synchronously\n", __func__, size/1024.0/1024.0);
+            synchronize();
+            return state_seq_get_data(seq_id, dst, size, flags);
+        }
+    }
+
+    auto lookup = [this](const ggml_tensor * t) -> ggml_backend_t {
+        const ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr) {
+            return nullptr;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+        for (auto & backend : backends) {
+            if (ggml_backend_get_device(backend.get()) == dev) {
+                return backend.get();
+            }
+        }
+        return nullptr;
+    };
+
+    uint8_t * staging = (uint8_t *) ggml_backend_buffer_get_base(pending.staging.get());
+
+    size_t n = 0;
+    try {
+        llama_io_write_stage io(staging, size, lookup);
+
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        n = state_seq_write_data(io, seq_id, flags);
+
+        for (ggml_backend_t backend : io.used_backends()) {
+            ggml_backend_event_ptr event(ggml_backend_event_new(ggml_backend_get_device(backend)));
+            if (!event) {
+                // no event support: wait for the reads now
+                ggml_backend_synchronize(backend);
+                continue;
+            }
+            ggml_backend_event_record(event.get(), backend);
+            pending.events.push_back(std::move(event));
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        // the reads that were enqueued must still complete before the staging buffer is reused
+        synchronize();
+        state_staging_pool.push_back(std::move(pending.staging));
+        return 0;
+    }
+
+    state_reads.push_back(std::move(pending));
+
+    return n;
+}
+
+void llama_context::state_reads_flush() {
+    for (auto & pending : state_reads) {
+        for (auto & event : pending.events) {
+            ggml_backend_event_synchronize(event.get());
+        }
+        memcpy(pending.dst, ggml_backend_buffer_get_base(pending.staging.get()), pending.size);
+        state_staging_pool.push_back(std::move(pending.staging));
+    }
+    state_reads.clear();
+}
+
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    // a pending asynchronous read of this or another sequence must land before the state changes
+    state_reads_flush();
+
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
@@ -3968,6 +4219,14 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     return ctx->get_embeddings_nextn_ith(i);
 }
 
+float * llama_get_embeddings_nextn_prev(llama_context * ctx) {
+    return ctx->get_embeddings_nextn_prev();
+}
+
+float * llama_get_embeddings_nextn_prev_ith(llama_context * ctx, int32_t i) {
+    return ctx->get_embeddings_nextn_prev_ith(i);
+}
+
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
@@ -4247,7 +4506,9 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    if (!(flags & LLAMA_STATE_SEQ_FLAGS_ASYNC)) {
+        ctx->synchronize();
+    }
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }

@@ -167,6 +167,11 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    // process a batch that the target decoded *before* the batch it is currently working on: reads the
+    // target's outputs of that earlier call (llama_get_embeddings_nextn_prev) without waiting for the
+    // current one. default: same as process (implementations that do not read target outputs)
+    virtual bool process_prev(const llama_batch & batch) { return process(batch); }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1357,6 +1362,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // process() reads the target rows of the previous decode call (see process_prev)
+    bool use_prev_rows = false;
+
+    const float * tgt_nextn(llama_context * ctx_tgt) const {
+        return use_prev_rows ? llama_get_embeddings_nextn_prev(ctx_tgt) : llama_get_embeddings_nextn(ctx_tgt);
+    }
+
+    const float * tgt_nextn_ith(llama_context * ctx_tgt, int32_t i) const {
+        return use_prev_rows ? llama_get_embeddings_nextn_prev_ith(ctx_tgt, i) : llama_get_embeddings_nextn_ith(ctx_tgt, i);
+    }
+
+    bool process_prev(const llama_batch & batch_in) override {
+        use_prev_rows = true;
+        const bool ok = process(batch_in);
+        use_prev_rows = false;
+        return ok;
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1525,7 +1548,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                const float * h_tgt = tgt_nextn(ctx_tgt);
+                GGML_ASSERT(h_tgt != nullptr);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -1585,7 +1609,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // a prompt batch: accept() only reads back verification batches (sampled token + draft),
                 // so keep just the last row, the pending h for the next draft
                 verify_h_rows[seq_id] = 0;
-                std::memcpy(pending_h[seq_id].data(), llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]), row_bytes);
+                std::memcpy(pending_h[seq_id].data(), tgt_nextn_ith(ctx_tgt, i_batch_end[seq_id]), row_bytes);
                 continue;
             }
 
@@ -1593,7 +1617,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = tgt_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
@@ -2793,6 +2817,20 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
+    }
+
+    return result;
+}
+
+bool common_speculative_process_prev(common_speculative * spec, const llama_batch & batch) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->process_prev(batch);
     }
 
     return result;

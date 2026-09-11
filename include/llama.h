@@ -915,6 +915,13 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// llama_state_seq_get_data_ext only: enqueue the device -> host reads behind the queued computation and return
+// immediately, without synchronizing the context. The data lands in dst asynchronously; dst must remain valid
+// and must not be read until the read is completed, which happens at the next llama_synchronize(),
+// llama_decode() (after its batch is queued), llama_state_seq_set_data_ext() or context destruction.
+// Lets a server checkpoint a sequence between decode calls without draining a pipeline-parallel context.
+#define LLAMA_STATE_SEQ_FLAGS_ASYNC 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(

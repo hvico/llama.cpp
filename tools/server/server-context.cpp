@@ -895,6 +895,20 @@ private:
 
     common_speculative_ptr spec;
 
+    // Deferred draft catch-up: a prompt-only batch is not handed to the speculative context right after
+    // its decode (which would wait for the target to finish it and drain the pipeline-parallel context),
+    // but after the *next* target decode has been queued, from the target's previous-call outputs. The
+    // draft part of the context checkpoints created in between is completed once the draft has caught up.
+    llama_batch spec_prev_batch = {};
+    bool        spec_prev_pending = false;
+
+    struct spec_ckpt_pending {
+        int     id_slot;
+        int     id_task;
+        int64_t n_tokens;
+    };
+    std::vector<spec_ckpt_pending> spec_ckpts_pending;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -936,6 +950,13 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (spec_prev_batch.token != nullptr) {
+            llama_batch_free(spec_prev_batch);
+            spec_prev_batch = {};
+        }
+        spec_prev_pending = false;
+        spec_ckpts_pending.clear();
+
         spec.reset();
         spec_init.reset();
 
@@ -1346,6 +1367,10 @@ private:
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+
+            if (spec) {
+                spec_prev_batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
+            }
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -1644,6 +1669,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                spec_flush();
                 ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
@@ -2306,6 +2332,52 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // complete the draft part of the context checkpoints that were waiting for the draft catch-up
+    void spec_complete_pending_ckpts() {
+        for (const auto & pc : spec_ckpts_pending) {
+            auto & slot = slots[pc.id_slot];
+
+            for (auto & ckpt : slot.prompt.checkpoints) {
+                if (ckpt.id_task == pc.id_task && ckpt.n_tokens == pc.n_tokens) {
+                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+                    common_speculative_get_state(spec.get(), slot.id, ckpt.data_spec);
+                    break;
+                }
+            }
+        }
+
+        spec_ckpts_pending.clear();
+    }
+
+    // hand the deferred batch to the speculative context. prev = true: the target has queued another
+    // batch since, so the rows of the deferred batch are read from the previous-call buffer
+    bool spec_process_deferred(bool prev) {
+        if (!spec_prev_pending) {
+            return true;
+        }
+
+        bool ok = true;
+        queue_tasks.yield_to_queue([&]() {
+            ok = prev ? common_speculative_process_prev(spec.get(), spec_prev_batch)
+                      : common_speculative_process     (spec.get(), spec_prev_batch);
+        });
+
+        spec_prev_pending = false;
+        common_batch_clear(spec_prev_batch);
+
+        spec_complete_pending_ckpts();
+
+        return ok;
+    }
+
+    // make sure the speculative context has processed everything the target has (before drafting,
+    // before saving a prompt, before an image chunk)
+    void spec_flush() {
+        if (spec_prev_pending && !spec_process_deferred(false)) {
+            SRV_ERR("%s", "failed to process the deferred speculative batch\n");
+        }
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
@@ -2344,10 +2416,20 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        // the reads are queued behind the decode that just ran and land while the next batch is processed:
+        // a checkpoint between the decode calls of a prompt does not drain the (pipeline-parallel) context.
+        // the checkpoint data is only read back through llama_state_seq_set_data, which completes the reads.
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+
+        if (spec_prev_pending) {
+            // the draft has not caught up with the last decoded batch yet: its part of the checkpoint is
+            // taken right after it does (spec_process_prev)
+            spec_ckpts_pending.push_back({slot.id, id_task, cur.n_tokens});
+        } else {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+            // stash the draft's speculative state with the checkpoint
+            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -2422,6 +2504,7 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
+                                spec_flush();
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
@@ -3026,6 +3109,8 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            spec_flush();
+
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
@@ -3473,6 +3558,9 @@ private:
                         //       so the timing is queued and flushed on the next sync
                         metrics_pre_decode();
 
+                        // the image chunk decodes on the target itself: hand over the deferred text batch first
+                        spec_flush();
+
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
@@ -3670,6 +3758,12 @@ private:
         });
 
         if (ret != 0) {
+            // complete any asynchronous checkpoint read before slots (and their checkpoints) can be released
+            llama_synchronize(ctx_tgt);
+            if (ctx_dft) {
+                llama_synchronize(ctx_dft);
+            }
+
             {
                 std::string err;
 
@@ -3727,9 +3821,29 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch_view);
-            });
+
+            // first the batch deferred from the previous decode: the target is now busy with this one
+            if (spec_prev_pending) {
+                ok = spec_process_deferred(true);
+            }
+
+            // a prompt-only batch without outputs is deferred; anything else (generation, the end of a
+            // prompt, embeddings) is processed now, its outputs are needed right away anyway
+            bool defer = ok && !has_output && !batch.has_embd && spec_prev_batch.token != nullptr;
+            for (int i = off; defer && i < off + batch_view.n_tokens; ++i) {
+                defer = batch.tokens[i].is_prompt;
+            }
+
+            if (defer) {
+                for (int i = 0; i < batch_view.n_tokens; ++i) {
+                    common_batch_add(spec_prev_batch, batch_view.token[i], batch_view.pos[i], { batch_view.seq_id[i][0] }, batch_view.logits[i]);
+                }
+                spec_prev_pending = true;
+            } else if (ok) {
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), batch_view);
+                });
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3821,6 +3935,7 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
+                    spec_flush();
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {

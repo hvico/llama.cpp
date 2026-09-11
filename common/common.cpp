@@ -1537,6 +1537,15 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
         if (llama_model_has_decoder(model)) {
             llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+
+            // a prompt-sized batch: loads the prefill kernels and lets the backends build and cache their
+            // graphs for full ubatches, so that the first real prompt does not pay for it (with lazy module
+            // loading and pipeline parallelism this took seconds on a multi-GPU context)
+            const int32_t n_warm = std::min<int32_t>({params.n_batch, 4*params.n_ubatch, 2048, (int32_t) llama_n_ctx(lctx) - (int32_t) tmp.size()});
+            if (n_warm > (int32_t) tmp.size() && params.n_ubatch > 1 && !llama_model_has_encoder(model)) {
+                std::vector<llama_token> tokens(n_warm, tmp[0]);
+                llama_decode(lctx, llama_batch_get_one(tokens.data(), n_warm));
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
