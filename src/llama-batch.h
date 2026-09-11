@@ -99,6 +99,12 @@ public:
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
+    // when set, split_simple and split_equal make one ubatch per sequence set (split_seq): with pipeline
+    // parallelism the ubatches of different sequences then overlap across the devices instead of being
+    // computed as one batch that walks the devices one after the other. set by llama_context::decode for
+    // batches of several short sequences (token generation of concurrent users)
+    void set_split_seq(bool value) { split_seq_hint = value; }
+
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
 
@@ -169,6 +175,8 @@ private:
 
     // used[i] indicates if token i has already been used in a previous ubatch
     std::vector<bool> used;
+
+    bool split_seq_hint = false;
 
     int debug;
 };

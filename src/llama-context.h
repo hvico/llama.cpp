@@ -325,6 +325,7 @@ private:
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
 
+
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
         buffer_view<float>       probs      = {nullptr, 0};
@@ -397,6 +398,9 @@ private:
 
     // set by decode(): the current call spans several ubatches (pipeline-parallel prefill)
     bool multi_ubatch_decode = false;
+
+    // graph capacity the scheduler was created with (see set_sampler)
+    size_t sched_max_nodes = 0;
 
     // asynchronous sequence state reads (LLAMA_STATE_SEQ_FLAGS_ASYNC): the state is read into a pinned
     // staging buffer behind the queued computation and copied to the caller's buffer at the next flush

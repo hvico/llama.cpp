@@ -104,7 +104,7 @@ static int64_t mmq_ids_J_hint(const int cc, const int64_t n_tokens, const int64_
     const int64_t tokens_per_expert = (n_tokens*n_expert_used + n_expert - 1) / n_expert;
     int64_t J = 2*tokens_per_expert;
     J = (J + 7) & ~int64_t(7);
-    return std::max(int64_t(24), std::min(int64_t(64), J));
+    return std::max(int64_t(16), std::min(int64_t(64), J));
 }
 
 void ggml_cuda_mul_mat_q(

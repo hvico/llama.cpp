@@ -474,6 +474,10 @@ void llama_batch_allocr::split_reset() {
 }
 
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+    if (split_seq_hint) {
+        return split_seq(n_ubatch);
+    }
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -508,6 +512,11 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+    if (split_seq_hint) {
+        // llama_context::decode only sets the hint when every sequence fits in one ubatch, so the tail constraint holds
+        return split_seq(n_ubatch);
+    }
+
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 

@@ -1814,7 +1814,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch_chunked(src0->type, cc, src0->ne[2], tensor->src[2]->ne[0])) {
         return false;
     }
 
@@ -1887,14 +1887,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
-                return false;
-            }
-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+    if (ggml_is_quantized(src0->type)) {
+        if (dst->ne[2] <= get_mmvq_mmid_max_batch_chunked(src0->type, cc, src0->ne[2], dst->src[2]->ne[0])) {
             return false;
         }
+    } else if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
+        return false;
     }
 
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
@@ -1923,19 +1921,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                    return;
-                }
-            } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                    return;
-                }
+        if (ggml_is_quantized(src0->type)) {
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch_chunked(src0->type, cc, ne02, ids->ne[0]);
+            if (ne2 <= mmvq_mmid_max) {
+                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                return;
             }
+        } else if (ne2 <= MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+            return;
         }
 
         if (ggml_cuda_mul_mat_id_hmma_supported(src0, src1, ids, dst, cc)) {
@@ -2651,9 +2645,9 @@ static bool ggml_cuda_graph_is_ring_key(const void * key) {
 
 static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     const int64_t rows = ggml_cuda_graph_max_rows(cuda_ctx, cgraph);
-    if (rows <= 1) {
-        return cgraph->nodes[0];
-    }
+    // single-row graphs are also keyed by their content: when several sequences are decoded as separate
+    // ubatches (pipelined token generation of concurrent users), each sequence's graph keeps its own
+    // cached CUDA graph instead of the alternation resetting the warmup of a single key every time
     if (rows > GGML_CUDA_GRAPH_RING_MIN_ROWS) {
         // odd small integers never collide with a real (aligned) node pointer
         return (const void *) (uintptr_t) (0x101 + 2*cuda_ctx->graph_ring_cur);

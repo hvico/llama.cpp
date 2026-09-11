@@ -230,7 +230,7 @@ struct ggml_cuda_mmq_config {
 // tiles (I=64, 2 blocks/SM) are ~25% faster than the Ampere tiles for wide tiles (MoE prefill),
 // while the Ampere tiles (I=128, stream-k) are ~8% faster for narrow tiles (small dense batches).
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_volta(ggml_type type, int J, bool fallback) {
-    return J <= 16 ? ggml_cuda_mmq_get_config_ampere(type, J, fallback) : ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+    return J <= 32 ? ggml_cuda_mmq_get_config_ampere(type, J, fallback) : ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
 }
 
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc) {

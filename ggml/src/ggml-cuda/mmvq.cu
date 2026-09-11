@@ -253,6 +253,25 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 }
 
 // Host function: returns the max batch size for the current arch+type at runtime.
+int get_mmvq_mmid_max_batch_chunked(ggml_type type, int cc, int64_t n_expert, int64_t n_expert_used) {
+    const int base = get_mmvq_mmid_max_batch(type, cc);
+
+    static const int max_env = getenv("GGML_CUDA_MMVQ_MMID_CHUNKED") ? atoi(getenv("GGML_CUDA_MMVQ_MMID_CHUNKED")) : -1;
+    if (max_env >= 0) {
+        return std::max(base, max_env);
+    }
+
+    // measured on Volta only; MMQ (dp4a, no int8 MMA) has the least to gain from tiles there
+    if (cc != GGML_CUDA_CC_VOLTA || n_expert <= 0 || n_expert_used <= 0) {
+        return base;
+    }
+
+    // up to ~1 token per expert on average: chunked MMVQ up to 32 tokens
+    const int64_t n_max = n_expert / n_expert_used;
+
+    return std::max<int64_t>(base, std::min<int64_t>(16, n_max));
+}
+
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
@@ -1375,7 +1394,8 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    // more tokens than the kernel handles at once: run the MUL_MAT_ID in chunks of tokens (see get_mmvq_mmid_max_batch_chunked)
+    const int64_t n_chunks = ids ? (ne12 + MMVQ_MAX_BATCH_SIZE - 1) / MMVQ_MAX_BATCH_SIZE : 1;
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
@@ -1385,7 +1405,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+        GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch_chunked(src0->type, cc, src0->ne[2], ids->ne[0]));
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
@@ -1465,11 +1485,21 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
-        ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
-        ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    for (int64_t ic = 0; ic < n_chunks; ++ic) {
+        const int64_t col0 = ic*MMVQ_MAX_BATCH_SIZE;
+        const int64_t ncols_chunk = n_chunks == 1 ? ncols_dst : std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, ncols_dst - col0);
+
+        // MUL_MAT_ID only: the token is the column of dst / of the quantized src1 and the row of ids
+        const char    * src1_chunk = (const char *) src1_q8_1.get() + col0*stride_col_y*sizeof(block_q8_1);
+        const int32_t * ids_chunk  = ids_d ? ids_d + col0*ids_stride : nullptr;
+        float         * dst_chunk  = dst_d + col0*stride_col_dst;
+
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_chunk, ids_chunk, fusion_local, dst_chunk, ne00,
+            ne01,              ncols_chunk,   s01, stride_col_y,     stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

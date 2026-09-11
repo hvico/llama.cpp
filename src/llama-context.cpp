@@ -598,6 +598,7 @@ void llama_context::sched_reserve() {
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    sched_max_nodes = max_nodes;
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1288,7 +1289,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        // a server sets (and clears) a sampler chain for every request: re-creating the scheduler each time
+        // (worst-case graphs rebuilt, compute buffers reallocated, cached graphs lost) is only needed when the
+        // graph capacity it was created with cannot hold the sampling nodes of the current sampler set.
+        // sizes that grow are handled by the allocator at runtime.
+        if (graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch)) > sched_max_nodes) {
+            sched_need_reserve = true;
+        }
 
         return true;
     }
@@ -1305,9 +1312,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         return false;
     }
 
+    // removing a sampler only removes nodes: the reserved buffers and graph capacity still fit
     sampling.samplers.erase(seq_id);
-
-    sched_need_reserve = true;
 
     return true;
 }
@@ -1441,7 +1447,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
             const uint32_t n_seqs_ws    = ubatch.n_seqs;
             const uint32_t n_tokens_ws  = std::min(cparams.n_ctx, cparams.n_ubatch);
-            const uint32_t n_outputs_ws = std::min(n_tokens_ws, cparams.n_outputs_max);
+            // with backend samplers the graph gets one sampling subgraph per output, so the topology depends on
+            // the number of outputs: reserve with this ubatch's count (0 for a prompt ubatch), otherwise the
+            // reserved graph would never match the following ubatches and every one of them would reallocate
+            const uint32_t n_outputs_ws = sampling.samplers.empty() ? std::min(n_tokens_ws, cparams.n_outputs_max) : (uint32_t) n_outputs;
 
             auto mctx_full = memory->init_full_ns(n_seqs_ws);
             if (!mctx_full) {
@@ -1557,6 +1566,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     ggml_status status;
     multi_ubatch_decode = false;
+    balloc->set_split_seq(false);
 
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
@@ -1814,6 +1824,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // more than one ubatch in this call: the ubatches can overlap across the pipeline stages
     multi_ubatch_decode = n_tokens_all > cparams.n_ubatch;
+
+    // several sequences, each short enough for one ubatch (concurrent token generation): with pipeline
+    // parallelism, one ubatch per sequence lets the devices work on different sequences at the same time,
+    // instead of one batch that visits the devices one after the other while the others idle
+    bool split_seq = false;
+    if (cparams.pipeline_parallel && !output_all && batch_inp.seq_id) {
+        std::map<llama_seq_id, uint32_t> n_tokens_seq;
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
+            for (int32_t s = 0; s < ns; ++s) {
+                n_tokens_seq[batch_inp.seq_id[i][s]]++;
+            }
+        }
+        // worth it from ~2 tokens per sequence (speculative verification): a single-token ubatch per sequence
+        // costs more host time (graph build, allocation, launches) than the batched step it replaces
+        split_seq = n_tokens_seq.size() > 1 && n_tokens_all >= 2*n_tokens_seq.size();
+        for (const auto & [seq_id, n] : n_tokens_seq) {
+            split_seq = split_seq && n <= cparams.n_ubatch;
+        }
+        if (split_seq) {
+            multi_ubatch_decode = true;
+        }
+    }
+    balloc->set_split_seq(split_seq);
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
@@ -2563,7 +2597,8 @@ static void ubatch_prepare_reserve(
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    // n_outputs == 0 is allowed for the runtime worst-case reserve of a prompt ubatch without outputs (with
+    // backend samplers the sampling subgraphs make the topology depend on the number of outputs)
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
