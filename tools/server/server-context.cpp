@@ -3047,6 +3047,13 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // with a limit on the number of drafting users, stop drafting when more slots are generating
+        int n_generating = 0;
+        for (const auto & slot : slots) {
+            n_generating += slot.state == SLOT_STATE_GENERATING;
+        }
+        const bool spec_allowed = params_base.speculative.n_max_active <= 0 || n_generating <= params_base.speculative.n_max_active;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3068,7 +3075,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = spec_allowed ? slot.get_n_draft_max() : 0;
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());

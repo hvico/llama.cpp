@@ -373,6 +373,10 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
+    // server: draft only while at most this many slots are generating (0 = always). On a bandwidth-bound
+    // MoE the verification batch of several users costs more than the tokens it accepts.
+    int32_t n_max_active = 0;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
