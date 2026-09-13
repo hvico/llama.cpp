@@ -3964,7 +3964,20 @@ private:
 
             slot.i_batch = -1;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
+            // LOCAL PATCH (2026-05): wrap sampler_accept in try/catch — grammar
+            // throw in json_object/tool-calls otherwise triggers std::terminate.
+            // Upstream: ggml-org/llama.cpp#21017 #21600 #15608 #13690.
+            try {
+                common_sampler_accept(slot.smpl.get(), id, true);
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "sampler_accept threw on token %d: %s — releasing slot\n",
+                        id, e.what());
+                send_error(slot,
+                           std::string("grammar/sampler error: ") + e.what(),
+                           ERROR_TYPE_SERVER);
+                slot.release();
+                return;
+            }
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
