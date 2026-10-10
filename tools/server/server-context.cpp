@@ -3230,6 +3230,15 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
+                        // a deferred draft batch can still hold rows of this sequence from the
+                        // slot's previous task (one released mid-prompt). It has to land before
+                        // the new prompt trims or shifts the slot's memory below: applied after
+                        // the trim it puts the draft ahead of the target (live A3B, 2026-10-10:
+                        // draft at pos 1838, new batch at 891 -> "inconsistent sequence
+                        // positions", then a corrupt checkpoint load -> abort). Same phase and
+                        // same call as the flush before an image chunk.
+                        spec_flush();
+
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
