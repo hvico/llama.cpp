@@ -2523,6 +2523,20 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            // a request cancelled mid-prompt can leave the draft context behind
+                            // the target (a deferred speculative batch) and checkpoint copies still
+                            // in flight (LLAMA_STATE_SEQ_FLAGS_ASYNC into data_tgt/data_dft). The
+                            // slot keeps its prompt for reuse, so both must land first: otherwise
+                            // the next request on this prefix decodes the draft at inconsistent
+                            // positions, loads a half-written checkpoint ("wrong sequence state
+                            // magic" -> abort), or the copy writes into a freed checkpoint buffer
+                            // (heap corruption -> SIGSEGV in free). Same rule as the decode-error
+                            // path below.
+                            spec_flush();
+                            llama_synchronize(ctx_tgt);
+                            if (ctx_dft) {
+                                llama_synchronize(ctx_dft);
+                            }
                             slot.release();
                             break;
                         }
